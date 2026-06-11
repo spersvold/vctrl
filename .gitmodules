@@ -1,0 +1,3 @@
+[submodule "sub/common"]
+	path = sub/common
+	url = https://github.com/spersvold/common_rtl.git
