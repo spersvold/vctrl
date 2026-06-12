@@ -50,7 +50,19 @@ module vctrl_regs import vctrl_pkg::*;
    input  logic [23:0]  clut_q,
 
    // video base address (framebuffer scanout base, word aligned)
-   output logic [31:2]  vbar
+   output logic [31:2]  vbar,
+
+   // PLL reconfiguration interface (to/from hdmi_pll_recfg).
+   //   pll_divcnt : PLLDIVCNT contents (logical M/N/C), quasi-static
+   //   pll_apply  : 1-cycle trigger pulse (clk_sys) on PLLCTRL.apply W1S write
+   //   pll_done   : 1-cycle completion pulse (clk_sys, CDC'd from recfg)
+   //   pll_locked : synchronized PLL locked status
+   //   pll_error  : synchronized recal-timeout/failure status
+   output plldivcnt_t   pll_divcnt,
+   output logic         pll_apply,
+   input  logic         pll_done,
+   input  logic         pll_locked,
+   input  logic         pll_error
    );
 
    //
@@ -62,6 +74,8 @@ module vctrl_regs import vctrl_pkg::*;
    logic                  hint, vint;
    logic                  acc, acc32, reg_acc, reg_wacc;
    logic [31:0]           reg_dato; // data output from registers
+
+   logic                  pll_busy;     // PLLCTRL.apply read-back (busy while reconfig in flight)
 
    //
    // Module body
@@ -166,12 +180,43 @@ module vctrl_regs import vctrl_pkg::*;
           reg_dato[15: 0] = {4'h0, vtim.tlen};
        end
        VBAR_ADR  : reg_dato = {vbar, 2'b0};
+       PLLDIVCNT_ADR : reg_dato = pll_divcnt;
+       PLLCTRL_ADR   : reg_dato = {29'h0, pll_error, pll_locked, pll_busy};
        PITCH_ADR : reg_dato = {20'h0, pitch};
        default   : reg_dato = 32'h0000_0000;
      endcase
 
    always_ff @(posedge clk_sys)
      cfg_q <= reg_acc ? reg_dato : {8'h0, clut_q};
+
+   // PLL divisor register (PLLDIVCNT). Latched only while no reconfig is in
+   // flight so an in-progress sequence cannot be corrupted mid-flight.
+   always_ff @(posedge clk_sys)
+     if (rst_sys)
+       pll_divcnt <= '0;
+     else if (reg_wacc & (reg_adr == PLLDIVCNT_ADR) & ~pll_busy)
+       pll_divcnt <= cfg_d;
+
+   // PLLCTRL.apply: W1S trigger with busy read-back. Writing 1 (when idle)
+   // emits a one-cycle pll_apply pulse and sets busy; busy clears when the
+   // reconfig FSM returns its done pulse. Writes ignored while busy.
+   always_ff @(posedge clk_sys)
+     if (rst_sys)
+       begin
+          pll_busy  <= 1'b0;
+          pll_apply <= 1'b0;
+       end
+     else
+       begin
+          pll_apply <= 1'b0;
+          if (reg_wacc & (reg_adr == PLLCTRL_ADR) & cfg_d[0] & ~pll_busy)
+            begin
+               pll_busy  <= 1'b1;
+               pll_apply <= 1'b1;
+            end
+          else if (pll_done)
+            pll_busy <= 1'b0;
+       end
 
    // generate interrupt request signal
    always_ff @(posedge clk_sys)

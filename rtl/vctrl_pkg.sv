@@ -15,15 +15,24 @@
 
 package vctrl_pkg;
 
-   localparam REG_ADR_HIBIT = 7;
+   // Register address decode hi-bit. Set to 8 so byte offsets up to 0x1FC are
+   // decoded -- the PLL reconfig CSRs live at 0x100/0x104, deliberately clear
+   // of the OpenCores ocfb register map (which only occupies the low offsets;
+   // anything in 0x0A0..0x7FF is free, 0x800+ is the CLUT region).
+   localparam REG_ADR_HIBIT = 8;
 
-   localparam [REG_ADR_HIBIT : 2] CTRL_ADR  = 6'b00_0000;
-   localparam [REG_ADR_HIBIT : 2] STAT_ADR  = 6'b00_0001;
-   localparam [REG_ADR_HIBIT : 2] HTIM_ADR  = 6'b00_0010;
-   localparam [REG_ADR_HIBIT : 2] VTIM_ADR  = 6'b00_0011;
-   localparam [REG_ADR_HIBIT : 2] HVLEN_ADR = 6'b00_0100;
-   localparam [REG_ADR_HIBIT : 2] VBAR_ADR  = 6'b00_0101;
-   localparam [REG_ADR_HIBIT : 2] PITCH_ADR = 6'b00_1000;
+   // OpenCores ocfb-compatible registers (byte offsets in comments)
+   localparam [REG_ADR_HIBIT : 2] CTRL_ADR      = 7'b000_0000; // 0x000
+   localparam [REG_ADR_HIBIT : 2] STAT_ADR      = 7'b000_0001; // 0x004
+   localparam [REG_ADR_HIBIT : 2] HTIM_ADR      = 7'b000_0010; // 0x008
+   localparam [REG_ADR_HIBIT : 2] VTIM_ADR      = 7'b000_0011; // 0x00C
+   localparam [REG_ADR_HIBIT : 2] HVLEN_ADR     = 7'b000_0100; // 0x010
+   localparam [REG_ADR_HIBIT : 2] VBAR_ADR      = 7'b000_0101; // 0x014
+   localparam [REG_ADR_HIBIT : 2] PITCH_ADR     = 7'b000_1000; // 0x020
+
+   // PLL reconfiguration CSRs (extension beyond the OpenCores ocfb register map)
+   localparam [REG_ADR_HIBIT : 2] PLLDIVCNT_ADR = 7'b100_0000; // 0x100 - PLL M/N/C divisors
+   localparam [REG_ADR_HIBIT : 2] PLLCTRL_ADR   = 7'b100_0001; // 0x104 - PLL reconfig trigger/status
 
    typedef enum logic [1:0] {
       BPP_8  = 2'd0,
@@ -55,6 +64,18 @@ package vctrl_pkg;
       logic         vie;    // vsync interrupt enable
       logic         ven;    // video system enable
    } ctrl_t;
+
+   // PLL divisor register (PLLDIVCNT): logical M/N/C divide values.
+   // Hardware (hdmi_pll_recfg) encodes these into the IOPLL counter fields.
+   //   M : feedback / multiply total count (4..320)
+   //   N : input divide                    (1..110)
+   //   C : post-scale, drives clk_pix      (1..510)
+   typedef struct packed {
+      logic [ 6:0] rsvd;    // [31:25]
+      logic [ 8:0] c;       // [24:16]
+      logic [ 6:0] n;       // [15: 9]
+      logic [ 8:0] m;       // [ 8: 0]
+   } plldivcnt_t;
 
    // LB colour channels
    typedef struct packed {

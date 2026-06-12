@@ -45,6 +45,13 @@ module vctrl_core import vctrl_pkg::*;
 
     input  logic                   clk_pix,      // Pixel clock
 
+    // PLL reconfiguration interface (to/from board-level hdmi_pll_recfg)
+    output plldivcnt_t             pll_divcnt,   // PLLDIVCNT (logical M/N/C)
+    output logic                   pll_apply,    // reconfig trigger pulse (clk_sys)
+    input  logic                   pll_done,     // reconfig done pulse (clk_sys)
+    input  logic                   pll_locked,   // synchronized PLL locked
+    input  logic                   pll_error,    // synchronized recal error
+
     output logic [            7:0] vga_r,        // VGA Red output
     output logic [            7:0] vga_g,        // VGA Green output
     output logic [            7:0] vga_b,        // VGA Blue output
@@ -110,7 +117,12 @@ module vctrl_core import vctrl_pkg::*;
       .clut_req  (cfg_clut_req),
       .clut_ack  (cfg_clut_ack),
       .clut_q    (cfg_clut_q),
-      .vbar);
+      .vbar,
+      .pll_divcnt,
+      .pll_apply,
+      .pll_done,
+      .pll_locked,
+      .pll_error);
 
    // Color Look Up Table (CLUT)
    vctrl_clut u_clut
