@@ -44,6 +44,7 @@ module vctrl_core import vctrl_pkg::*;
     input  logic                   fb_rvalid,    // Memory read data valid
 
     input  logic                   clk_pix,      // Pixel clock
+    input  logic                   rst_pix,      // Pixel-domain reset (board-generated, async-assert/sync-deassert)
 
     // PLL reconfiguration interface (to/from board-level hdmi_pll_recfg)
     output plldivcnt_t             pll_divcnt,   // PLLDIVCNT (logical M/N/C)
@@ -90,8 +91,7 @@ module vctrl_core import vctrl_pkg::*;
    logic                           hsync, vsync,
                                    gate, frame, line;
 
-   logic                           rst_pix;      // Video reset
-
+   logic                           ven_pix;      // VEN synchronized into the pixel domain (scan enable)
 
    // ========================================================================
    // ========================================================================
@@ -139,14 +139,19 @@ module vctrl_core import vctrl_pkg::*;
       .cp_clut_q,
       .cp_clut_ack);
 
-   // synchronize timing/control settings; from clk_sys domain to clk_pix domain
-   synchronizer #(2) u_rst_pix_sync
-     (.clk(clk_pix), .d(~ctrl.ven), .q(rst_pix));
+   // VEN crosses into the pixel domain as a frame-aligned scan ENABLE (not a
+   // reset). The pixel-domain reset (rst_pix) is board-generated from the same
+   // source as rst_sys -- so disabling video no longer async-resets the pixel
+   // domain (which used to tear the line-buffer/frame_sys CDCs and strand the
+   // fetch path). See vctrl_timing.
+   synchronizer #(2) u_ven_pix_sync
+     (.clk(clk_pix), .d(ctrl.ven), .q(ven_pix));
 
    // Video Timing module
    vctrl_timing u_timing
      (.clk_pix,
       .rst_pix,
+      .ven_pix,
       .htim,
       .vtim,
       .hspol    (ctrl.hsl),
@@ -165,7 +170,7 @@ module vctrl_core import vctrl_pkg::*;
       .LB_DEPTH (LB_DEPTH))
    u_fbuff
      (.clk_sys,
-      .rst_sys  (~ctrl.ven),
+      .rst_sys,
       .fb_rdreq,
       .fb_raddr,
       .fb_rdack,

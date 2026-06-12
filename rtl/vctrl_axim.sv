@@ -203,7 +203,13 @@ module vctrl_axim
 
    wire hit       = beat_valid & (req_beat == beat_addr);
    wire need_load = ~beat_valid | (req_beat != beat_addr);   // first access of a new beat
-   assign fifo_rd = need_load & ~fifo_empty & ~flush;
+   // Gate the pop on an actual request: without fb_rdreq, req_beat is stale
+   // (e.g. fb_raddr=0 after the consumer is reset) so need_load would stick
+   // high and drain the FIFO with no consumer -- which keeps room_for_burst
+   // true and runs the prefetch pointer off the end of the framebuffer (and off
+   // the end of memory), stalling the AXI read channel. Requiring fb_rdreq
+   // bounds the prefetch to <= FIFO_DEPTH ahead of real consumption.
+   assign fifo_rd = fb_rdreq & need_load & ~fifo_empty & ~flush;
 
    assign fb_rdack = fb_rdreq & hit & ~flush;
 

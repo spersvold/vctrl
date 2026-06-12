@@ -17,6 +17,7 @@ module vctrl_timing import vctrl_pkg::*;
    (
     input  logic             clk_pix,      // Pixel clock
     input  logic             rst_pix,      // Video reset
+    input  logic             ven_pix,      // Video enable
 
     input  timing_t          htim,         // horizontal timing settings
     input  timing_t          vtim,         // vertical timing settings inputs
@@ -62,6 +63,7 @@ module vctrl_timing import vctrl_pkg::*;
    vpos_t                    vpos;
 
    logic                     clk_en;
+   logic                     scan_en;      // raster running (frame-aligned VEN)
 
    assign thsync = hpos_t'(htim.tsync);
    assign thgdel = hpos_t'(htim.tgdel);
@@ -83,12 +85,25 @@ module vctrl_timing import vctrl_pkg::*;
    assign sv1 = sv2 - tvsync - vpos_t'(1);
    assign vr  = tvgate + vpos_t'(1); // active end, front porch start
 
+   // Frame-aligned scan enable. `en` (VEN, synchronized) starts the raster from
+   // the parked front-porch state and stops it at the next frame boundary, so
+   // the pixel datapath quiesces/restarts cleanly with no async cross-domain
+   // reset. When parked the counters hold the front-porch (blanking) state --
+   // identical to the power-up reset state -- so a restart yields a clean frame.
+   wire frame_pt = (hpos == hr) & (vpos == vr); // frame-start / parked point
    always_ff @(posedge clk_pix)
-     if (rst_pix) clk_en <= 1'b1;
+     if (rst_pix)                                      scan_en <= 1'b0;
+     else if (~scan_en &  ven_pix)                     scan_en <= 1'b1;  // start
+     else if ( scan_en & ~ven_pix & frame_pt & clk_en) scan_en <= 1'b0;  // stop at frame boundary
+
+   wire rst_int = rst_pix | ~scan_en;           // internal reset
+
+   always_ff @(posedge clk_pix)
+     if (rst_int) clk_en <= 1'b1;
      else         clk_en <= (is_dbl) ? ~clk_en : clk_en; // in doublescan mode, count pixels half as fast
 
    always_ff @(posedge clk_pix)
-     if (rst_pix) hpos <= hr; // in reset start at front-porch
+     if (rst_int) hpos <= hr; // in reset start at front-porch
      else if (clk_en)
        if (hpos == thlen)
          hpos <= '0;
@@ -97,7 +112,7 @@ module vctrl_timing import vctrl_pkg::*;
 
    wire clk_en_v = clk_en & (hpos == thgate); // enable vertical counter at end of active horizontal
    always_ff @(posedge clk_pix)
-     if (rst_pix) vpos <= vr; // in reset start at front-porch
+     if (rst_int) vpos <= vr; // in reset start at front-porch
      else if (clk_en_v)
        if (vpos == tvlen)
          vpos <= '0;
@@ -113,15 +128,15 @@ module vctrl_timing import vctrl_pkg::*;
 
    // control signals
    always_ff @(posedge clk_pix)
-     if (rst_pix) frame <= 1'b0;
+     if (rst_int) frame <= 1'b0;
      else         frame <= ((hpos == hr)  & (vpos == vr));
 
    always_ff @(posedge clk_pix)
-     if (rst_pix) line  <= 1'b0;
+     if (rst_int) line  <= 1'b0;
      else         line  <= ((hpos == hr)  & (vpos <  vr));
 
    always_ff @(posedge clk_pix)
-     if (rst_pix) gate  <= 1'b0;
+     if (rst_int) gate  <= 1'b0;
      else         gate  <= ((hpos <  hr)  & (vpos <  vr));
 
 endmodule // vctrl_timing
