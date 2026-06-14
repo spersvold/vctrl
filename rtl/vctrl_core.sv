@@ -110,7 +110,11 @@ module vctrl_core import vctrl_pkg::*;
       .irq,
       .ctrl,
       .hint_in   (1'b0 /*vga_hs*/),
-      .vint_in   (1'b0 /*vga_vs*/),
+      // frame_sys is the start-of-frame pulse already CDC'd into clk_sys
+      // (cdc_tgl in vctrl_fbuff) -- a clean once-per-frame vsync interrupt
+      // request for KMS vblank. It coincides with vctrl_axim latching the
+      // scanout base, so the IRQ marks exactly when a flipped buffer goes live.
+      .vint_in   (frame_sys),
       .htim,
       .vtim,
       .pitch,
