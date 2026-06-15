@@ -56,6 +56,9 @@ module vctrl_axim
     // Video controller framebuffer read port (slave, read-only)
     // ----------------------------------------------------------------------
     input  logic [ADDR_WIDTH-1:0]      fb_base,    // framebuffer base address
+    input  logic [ADDR_WIDTH-1:0]      fb_size,    // framebuffer size in bytes (bounds prefetch)
+    input  logic                       ven,        // scanout enabled; gates prefetch off when 0
+    output logic                       fetch_idle, // no reads in flight (safe to retire the buffer)
     input  logic                       frame_sys,  // start-of-frame (restart prefetch)
     input  logic                       fb_rdreq,
     input  logic [FB_ADDR_WIDTH-1:0]   fb_raddr,
@@ -133,8 +136,10 @@ module vctrl_axim
    // ========================================================================
    logic [ADDR_WIDTH-1:0]              pf_addr;       // next burst address (beat aligned)
    logic [ADDR_WIDTH-1:0]              fb_base_r;     // base latched for the current frame
+   logic [ADDR_WIDTH:0]                fb_end_r;      // base+size latched (33-bit; prefetch bound)
    logic [CNTW-1:0]                    out_beats;     // beats requested but not yet returned
    logic                               armed;         // a frame has been started at least once
+   logic                               ven_r;
 
    wire ar_acc = m_axi_arvalid & m_axi_arready;
    wire r_acc  = m_axi_rvalid  & m_axi_rready;
@@ -146,7 +151,21 @@ module vctrl_axim
    // (counting beats already in flight)
    wire room_for_burst = (out_beats + {1'b0, fifo_fill} + CNTW'(BURST_LEN)) <= CNTW'(FIFO_DEPTH);
 
-   assign m_axi_arvalid = armed & ~flush & room_for_burst;
+   // No reads outstanding to memory. After the consumer drops ven this falls
+   // and stays low once the in-flight reads return, so software can wait on it
+   // before the buffer's mapping is torn down.
+   assign fetch_idle = (out_beats == '0);
+
+   // Issue a burst only while scanout is enabled (ven). Gating on ven -- not
+   // just letting the timing stop -- is what halts the read-ahead on disable:
+   // otherwise the prefetcher keeps topping up the FIFO from the current buffer
+   // and an in-flight read can fault when that buffer is unmapped. Also stop at
+   // the end of the framebuffer (base + size): the read-ahead would otherwise
+   // run a few bursts past the last line, which behind an IOMMU/SMMU hits an
+   // unmapped page (on a flat map it silently read adjacent memory). 33-bit
+   // compare so base+size at the top of the 4 GiB window does not wrap.
+   assign m_axi_arvalid = ven & armed & ~flush & room_for_burst &
+                          ({1'b0, pf_addr} < fb_end_r);
    assign m_axi_araddr  = pf_addr;
    assign m_axi_arid    = '0;
    assign m_axi_arlen   = 8'(BURST_LEN - 1);
@@ -157,6 +176,10 @@ module vctrl_axim
    assign m_axi_arprot  = 3'b000;
    assign m_axi_rready  = 1'b1;
 
+   // Detect rising and falling edges of VEN to re-capture fb_base/end
+   wire ven_rise =  ven & ~ven_r;
+   wire ven_fall = ~ven &  ven_r;
+
    always_ff @(posedge clk) begin
       // outstanding beat accounting
       unique case ({ar_acc, r_acc})
@@ -166,25 +189,34 @@ module vctrl_axim
         default: out_beats <= out_beats;
       endcase
 
+      ven_r <= ven;
+
       if (ar_acc)
         pf_addr <= pf_addr + ADDR_WIDTH'(BURST_LEN * STRB_WIDTH);
 
       // frame restart: latch base, rewind prefetch, begin flush/drain
-      if (frame_sys) begin
+      if (frame_sys | ven_rise) begin
          armed     <= 1'b1;
          flush     <= 1'b1;
          fb_base_r <= fb_base;
+         fb_end_r  <= {1'b0, fb_base} + {1'b0, fb_size};
          pf_addr   <= {fb_base[ADDR_WIDTH-1:BEAT_LSB], {BEAT_LSB{1'b0}}};
       end
       else if (flush & (out_beats == '0)) begin
          flush <= 1'b0;                 // drained; resume prefetch
       end
 
+      // Disarm when VEN deasserts
+      if (ven_fall)
+        armed <= 1'b0;
+
       if (rst) begin
+         ven_r     <= 1'b0;
          armed     <= 1'b0;
          flush     <= 1'b0;
          pf_addr   <= '0;
          fb_base_r <= '0;
+         fb_end_r  <= '0;
          out_beats <= '0;
       end
    end

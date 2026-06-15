@@ -28,6 +28,7 @@ package vctrl_pkg;
    localparam [REG_ADR_HIBIT : 2] VTIM_ADR      = 7'b000_0011; // 0x00C
    localparam [REG_ADR_HIBIT : 2] HVLEN_ADR     = 7'b000_0100; // 0x010
    localparam [REG_ADR_HIBIT : 2] VBAR_ADR      = 7'b000_0101; // 0x014
+   localparam [REG_ADR_HIBIT : 2] VSIZ_ADR      = 7'b000_0110; // 0x018 - scanout buffer size (bounds the prefetch)
    localparam [REG_ADR_HIBIT : 2] PITCH_ADR     = 7'b000_1000; // 0x020
 
    // PLL reconfiguration CSRs (extension beyond the OpenCores ocfb register map)

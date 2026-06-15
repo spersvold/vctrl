@@ -34,6 +34,7 @@ module vctrl_regs import vctrl_pkg::*;
    // status register inputs
    input  logic         hint_in,      // hsync interrupt request
    input  logic         vint_in,      // vsync interrupt request
+   input  logic         fetch_idle,   // scanout fetch idle (no reads in flight)
 
    // Horizontal Timing Register
    output timing_t      htim,
@@ -51,6 +52,10 @@ module vctrl_regs import vctrl_pkg::*;
 
    // video base address (framebuffer scanout base, word aligned)
    output logic [31:2]  vbar,
+
+   // scanout buffer size in bytes (word granular); bounds the framebuffer
+   // fetch so scanout never reads past the end of the buffer
+   output logic [31:2]  vsiz,
 
    // PLL reconfiguration interface (to/from hdmi_pll_recfg).
    //   pll_divcnt : PLLDIVCNT contents (logical M/N/C), quasi-static
@@ -95,6 +100,7 @@ module vctrl_regs import vctrl_pkg::*;
           htim <= '0;
           vtim <= '0;
           vbar <= '0;
+          vsiz <= '0;
        end
      else if (reg_wacc)
        unique case (reg_adr)
@@ -114,6 +120,9 @@ module vctrl_regs import vctrl_pkg::*;
          end
          VBAR_ADR  : begin
             vbar       <= cfg_d[31: 2];
+         end
+         VSIZ_ADR  : begin
+            vsiz       <= cfg_d[31: 2];
          end
          PITCH_ADR : begin
             pitch      <= cfg_d[11: 0];
@@ -164,7 +173,7 @@ module vctrl_regs import vctrl_pkg::*;
    always_comb
      unique casez (reg_adr)
        CTRL_ADR  : reg_dato = ctrl;
-       STAT_ADR  : reg_dato = {26'h0, hint, vint, 4'h0};
+       STAT_ADR  : reg_dato = {23'h0, fetch_idle, 2'h0, hint, vint, 4'h0};
        HTIM_ADR  : begin
           reg_dato[31:24] = htim.tsync;
           reg_dato[23:16] = htim.tgdel;
@@ -180,6 +189,7 @@ module vctrl_regs import vctrl_pkg::*;
           reg_dato[15: 0] = {4'h0, vtim.tlen};
        end
        VBAR_ADR  : reg_dato = {vbar, 2'b0};
+       VSIZ_ADR  : reg_dato = {vsiz, 2'b0};
        PLLDIVCNT_ADR : reg_dato = pll_divcnt;
        PLLCTRL_ADR   : reg_dato = {29'h0, pll_error, pll_locked, pll_busy};
        PITCH_ADR : reg_dato = {20'h0, pitch};

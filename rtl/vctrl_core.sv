@@ -36,6 +36,9 @@ module vctrl_core import vctrl_pkg::*;
     output logic                   irq,          // Interrupt
     output logic                   frame_sys,    // Start of new frame (in system clock domain)
     output logic [31:2]            vbar,         // Video base address (scanout base)
+    output logic [31:2]            vsiz,         // Scanout buffer size (bytes); bounds the fetch
+    output logic                   ven,          // Scanout enable (CTRL.VEN); gates the fetch
+    input  logic                   fetch_idle,   // Scanout fetch idle (no reads in flight)
 
     output logic                   fb_rdreq,     // Memory read request
     output logic [VR_ADDRW   -1:0] fb_raddr,     // Memory read address
@@ -115,6 +118,7 @@ module vctrl_core import vctrl_pkg::*;
       // request for KMS vblank. It coincides with vctrl_axim latching the
       // scanout base, so the IRQ marks exactly when a flipped buffer goes live.
       .vint_in   (frame_sys),
+      .fetch_idle,
       .htim,
       .vtim,
       .pitch,
@@ -122,11 +126,17 @@ module vctrl_core import vctrl_pkg::*;
       .clut_ack  (cfg_clut_ack),
       .clut_q    (cfg_clut_q),
       .vbar,
+      .vsiz,
       .pll_divcnt,
       .pll_apply,
       .pll_done,
       .pll_locked,
       .pll_error);
+
+   // Scanout enable out to the fetch master: when software clears CTRL.VEN the
+   // master stops issuing reads, so its in-flight reads can drain before the
+   // framebuffer mapping is torn down.
+   assign ven = ctrl.ven;
 
    // Color Look Up Table (CLUT)
    vctrl_clut u_clut
