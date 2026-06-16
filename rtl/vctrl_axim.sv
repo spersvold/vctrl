@@ -117,7 +117,7 @@ module vctrl_axim
    wire [FIFO_LGDEPTH:0]               fifo_fill;
    logic                               flush;     // draining for a frame restart
 
-   scfifo #
+   sfifo #
      (.WIDTH (AXI_DATA_WIDTH),
       .LGSIZ (FIFO_LGDEPTH))
    u_fifo
