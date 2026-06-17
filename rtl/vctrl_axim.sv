@@ -149,7 +149,7 @@ module vctrl_axim
 
    // issue a burst when armed, not flushing, and the FIFO has room for it
    // (counting beats already in flight)
-   wire room_for_burst = (out_beats + {1'b0, fifo_fill} + CNTW'(BURST_LEN)) <= CNTW'(FIFO_DEPTH);
+   wire room_for_burst = (out_beats + {1'b0, fifo_fill} + CNTW'(2*BURST_LEN)) <= CNTW'(FIFO_DEPTH);
 
    // No reads outstanding to memory. After the consumer drops ven this falls
    // and stays low once the in-flight reads return, so software can wait on it
@@ -164,9 +164,11 @@ module vctrl_axim
    // run a few bursts past the last line, which behind an IOMMU/SMMU hits an
    // unmapped page (on a flat map it silently read adjacent memory). 33-bit
    // compare so base+size at the top of the 4 GiB window does not wrap.
-   assign m_axi_arvalid = ven & armed & ~flush & room_for_burst &
-                          ({1'b0, pf_addr} < fb_end_r);
-   assign m_axi_araddr  = pf_addr;
+
+   wire ar_pending = m_axi_arvalid & ~m_axi_arready;
+   wire can_launch = ven & armed & ~flush & room_for_burst &
+                     ({1'b0, pf_addr} < fb_end_r) & ~ar_pending;
+
    assign m_axi_arid    = '0;
    assign m_axi_arlen   = 8'(BURST_LEN - 1);
    assign m_axi_arsize  = 3'(AXSIZE);
@@ -191,18 +193,27 @@ module vctrl_axim
 
       ven_r <= ven;
 
-      if (ar_acc)
-        pf_addr <= pf_addr + ADDR_WIDTH'(BURST_LEN * STRB_WIDTH);
+      // clear pending request when ready
+      if (m_axi_arready)
+        m_axi_arvalid <= 1'b0;
+
+      // AR request register: launch (latch address, advance pointer), then hold
+      // the request unchanged until arready
+      if (can_launch) begin
+         m_axi_arvalid <= 1'b1;
+         m_axi_araddr  <= pf_addr;
+         pf_addr       <= pf_addr + ADDR_WIDTH'(BURST_LEN * STRB_WIDTH);
+      end
 
       // frame restart: latch base, rewind prefetch, begin flush/drain
       if (frame_sys | ven_rise) begin
-         armed     <= 1'b1;
+         armed     <= frame_sys;
          flush     <= 1'b1;
          fb_base_r <= fb_base;
          fb_end_r  <= {1'b0, fb_base} + {1'b0, fb_size};
          pf_addr   <= {fb_base[ADDR_WIDTH-1:BEAT_LSB], {BEAT_LSB{1'b0}}};
       end
-      else if (flush & (out_beats == '0)) begin
+      else if (flush & (out_beats == '0) & ~ar_pending) begin
          flush <= 1'b0;                 // drained; resume prefetch
       end
 
@@ -218,6 +229,7 @@ module vctrl_axim
          fb_base_r <= '0;
          fb_end_r  <= '0;
          out_beats <= '0;
+         m_axi_arvalid <= 1'b0;
       end
    end
 
