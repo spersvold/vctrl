@@ -24,7 +24,12 @@ module axi_ram
    // Width of ID signal
    parameter ID_WIDTH = 8,
    // Extra pipeline register on output
-   parameter PIPELINE_OUTPUT = 0
+   parameter PIPELINE_OUTPUT = 0,
+   // Fixed response latency (cycles) added to the R and B channels; 0 = off.
+   // Assumes the master holds R/B ready high (vctrl_axim and vctrl_dma_rd do):
+   // it delays the response stream, which also makes the model accept multiple
+   // outstanding bursts -- so it exercises latency hiding, not just slowdown.
+   parameter RESP_LATENCY = 0
    )
   (
    input  logic                   clk,
@@ -141,16 +146,54 @@ module axi_ram
    wire [VALID_ADDR_WIDTH-1:0] write_addr_valid = VALID_ADDR_WIDTH'(write_addr_reg >> (ADDR_WIDTH - VALID_ADDR_WIDTH));
 
    assign s_axi_awready = s_axi_awready_reg;
-   assign s_axi_wready = s_axi_wready_reg;
-   assign s_axi_bid = s_axi_bid_reg;
-   assign s_axi_bresp = 2'b00; //AXRESP_OKAY;
-   assign s_axi_bvalid = s_axi_bvalid_reg;
+   assign s_axi_wready  = s_axi_wready_reg;
    assign s_axi_arready = s_axi_arready_reg;
-   assign s_axi_rid = PIPELINE_OUTPUT ? s_axi_rid_pipe_reg : s_axi_rid_reg;
-   assign s_axi_rdata = PIPELINE_OUTPUT ? s_axi_rdata_pipe_reg : s_axi_rdata_reg;
-   assign s_axi_rresp = 2'b00; //AXRESP_OKAY;
-   assign s_axi_rlast = PIPELINE_OUTPUT ? s_axi_rlast_pipe_reg : s_axi_rlast_reg;
-   assign s_axi_rvalid = PIPELINE_OUTPUT ? s_axi_rvalid_pipe_reg : s_axi_rvalid_reg;
+   assign s_axi_bresp   = 2'b00; //AXRESP_OKAY;
+   assign s_axi_rresp   = 2'b00; //AXRESP_OKAY;
+
+   // FSM response outputs (pre-latency)
+   wire                  rvalid_pre = PIPELINE_OUTPUT ? s_axi_rvalid_pipe_reg : s_axi_rvalid_reg;
+   wire [ID_WIDTH-1:0]   rid_pre    = PIPELINE_OUTPUT ? s_axi_rid_pipe_reg    : s_axi_rid_reg;
+   wire [DATA_WIDTH-1:0] rdata_pre  = PIPELINE_OUTPUT ? s_axi_rdata_pipe_reg  : s_axi_rdata_reg;
+   wire                  rlast_pre  = PIPELINE_OUTPUT ? s_axi_rlast_pipe_reg  : s_axi_rlast_reg;
+
+   generate
+     if (RESP_LATENCY == 0) begin : g_nolat
+        assign s_axi_rvalid = rvalid_pre;
+        assign s_axi_rid    = rid_pre;
+        assign s_axi_rdata  = rdata_pre;
+        assign s_axi_rlast  = rlast_pre;
+        assign s_axi_bvalid = s_axi_bvalid_reg;
+        assign s_axi_bid    = s_axi_bid_reg;
+     end
+     else begin : g_lat
+        // Delay the response payload (valid + fields) RESP_LATENCY cycles via a
+        // chain of register stages (stage[0] = live FSM output). The master is
+        // assumed to hold ready high, so no backpressure handling is needed.
+        localparam int RW = 1 + ID_WIDTH + DATA_WIDTH + 1;  // {valid,id,data,last}
+        localparam int BW = 1 + ID_WIDTH;                   // {valid,id}
+        logic [RW-1:0] r_stg [0:RESP_LATENCY];
+        logic [BW-1:0] b_stg [0:RESP_LATENCY];
+
+        assign r_stg[0] = {rvalid_pre, rid_pre, rdata_pre, rlast_pre};
+        assign b_stg[0] = {s_axi_bvalid_reg, s_axi_bid_reg};
+
+        for (genvar gi = 0; gi < RESP_LATENCY; gi++) begin : g_stage
+           always_ff @(posedge clk)
+             if (rst) begin
+                r_stg[gi+1] <= '0;
+                b_stg[gi+1] <= '0;
+             end
+             else begin
+                r_stg[gi+1] <= r_stg[gi];
+                b_stg[gi+1] <= b_stg[gi];
+             end
+        end
+
+        assign {s_axi_rvalid, s_axi_rid, s_axi_rdata, s_axi_rlast} = r_stg[RESP_LATENCY];
+        assign {s_axi_bvalid, s_axi_bid}                          = b_stg[RESP_LATENCY];
+     end
+   endgenerate
 
    always_comb begin
       write_state_next = WRITE_STATE_IDLE;

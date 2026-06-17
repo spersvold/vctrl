@@ -95,4 +95,88 @@ package vctrl_pkg;
       endcase
    endfunction // fb_cidxb
 
+   // ===================================================================
+   // DMA engine (vctrl_dma) ABI
+   //
+   //   The DMA engine exposes its own register slave (cmd_*), a
+   //   sibling of the core's cfg_* register bus using the same request/ack
+   //   protocol. It moves data with two AXI masters: a read master that
+   //   fetches from a source buffer and a write master that stores to the
+   //   destination, signalling completion with a monotonic fence seqno and
+   //   an interrupt. Datapath sizing (AXI width, burst length, FIFO depth)
+   //   is carried as vctrl_dma module parameters, not here -- this is the
+   //   software-visible contract only.
+   // ===================================================================
+
+   localparam logic [15:0] DMA_VERSION = 16'h0100;               // 1.0
+   localparam logic [31:0] DMA_IDENT   = {16'h7643, DMA_VERSION};  // "vc" + version
+
+   // CSR map -- cmd_* window. Word addresses; byte offsets in comments.
+   localparam [REG_ADR_HIBIT : 2] DMA_ID_ADR           = 7'h00; // 0x00 RO   identification
+   localparam [REG_ADR_HIBIT : 2] DMA_CTRL_ADR         = 7'h01; // 0x04 RW   enable / soft-reset
+   localparam [REG_ADR_HIBIT : 2] DMA_STATUS_ADR       = 7'h02; // 0x08 RO   busy / idle / error / state
+   localparam [REG_ADR_HIBIT : 2] DMA_IRQ_ADR          = 7'h03; // 0x0C RW1C interrupt status
+   localparam [REG_ADR_HIBIT : 2] DMA_IRQEN_ADR        = 7'h04; // 0x10 RW   interrupt mask
+   // PIO descriptor (Phase 1a direct submit; kept as a debug path)
+   localparam [REG_ADR_HIBIT : 2] DMA_SRC_ADR          = 7'h08; // 0x20 RW   source byte address
+   localparam [REG_ADR_HIBIT : 2] DMA_DST_ADR          = 7'h09; // 0x24 RW   destination byte offset
+   localparam [REG_ADR_HIBIT : 2] DMA_SRCPITCH_ADR     = 7'h0A; // 0x28 RW   source row stride (bytes)
+   localparam [REG_ADR_HIBIT : 2] DMA_DSTPITCH_ADR     = 7'h0B; // 0x2C RW   dest row stride (bytes)
+   localparam [REG_ADR_HIBIT : 2] DMA_WIDTH_ADR        = 7'h0C; // 0x30 RW   bytes per row
+   localparam [REG_ADR_HIBIT : 2] DMA_HEIGHT_ADR       = 7'h0D; // 0x34 RW   rows (1 => linear copy)
+   localparam [REG_ADR_HIBIT : 2] DMA_OP_ADR           = 7'h0E; // 0x38 RW   [7:0] opcode, [15:8] flags
+   localparam [REG_ADR_HIBIT : 2] DMA_DOORBELL_ADR     = 7'h0F; // 0x3C WO   write seqno -> execute descriptor
+   // Fence / error
+   localparam [REG_ADR_HIBIT : 2] DMA_FENCE_ADR        = 7'h10; // 0x40 RO   last completed seqno
+   localparam [REG_ADR_HIBIT : 2] DMA_ERR_ADR          = 7'h11; // 0x44 RO   error info (resp/fault)
+   // Ring submit (Phase 1b; reserved so the ABI is stable)
+   localparam [REG_ADR_HIBIT : 2] DMA_RINGBASE_ADR     = 7'h14; // 0x50 RW   host ring base address
+   localparam [REG_ADR_HIBIT : 2] DMA_RINGSIZE_ADR     = 7'h15; // 0x54 RW   log2(entries)
+   localparam [REG_ADR_HIBIT : 2] DMA_RINGTAIL_ADR     = 7'h16; // 0x58 WO   producer doorbell (tail)
+   localparam [REG_ADR_HIBIT : 2] DMA_RINGHEAD_ADR     = 7'h17; // 0x5C RO   consumer pointer (head)
+
+   // DMA_CTRL bit positions
+   localparam int DMA_CTRL_ENABLE = 0;   // engine enable
+   localparam int DMA_CTRL_RESET  = 1;   // soft reset (self-clearing)
+
+   // DMA_STATUS bit positions ([11:4] = FSM state, debug)
+   localparam int DMA_STAT_BUSY   = 0;   // a command is executing
+   localparam int DMA_STAT_IDLE   = 1;   // engine idle, no in-flight beats
+   localparam int DMA_STAT_ERROR  = 2;   // sticky error (see DMA_ERR)
+
+   // DMA_IRQ / DMA_IRQEN bit positions (DMA_IRQ is write-1-to-clear)
+   localparam int DMA_IRQ_DONE    = 0;   // command completed (fence advanced)
+   localparam int DMA_IRQ_ERROR   = 1;   // command faulted
+
+   // Opcodes (DMA_OP[7:0] / descriptor opflags[7:0])
+   typedef enum logic [7:0] {
+      DMA_OP_NOP    = 8'd0,
+      DMA_OP_COPY2D = 8'd1,   // 2D strided copy source -> destination (linear = height 1)
+      DMA_OP_FILL   = 8'd2,   // solid fill of destination (src_addr = pattern) [Phase 1.5]
+      DMA_OP_FENCE  = 8'd3    // advance fence + raise IRQ, no data movement
+   } dma_opcode_t;
+
+   // Command descriptor (8 words = 32 bytes). Same layout for the PIO
+   // registers and the in-memory ring; opflags is the least-significant
+   // word (word0, lowest byte address in the ring):
+   //   word0 opflags  [7:0] opcode, [15:8] flags
+   //   word1 seqno    fence value reported on completion
+   //   word2 src_addr source byte address (read master)
+   //   word3 dst_addr destination byte offset (write master)
+   //   word4 src_pitch / word5 dst_pitch  row strides (bytes)
+   //   word6 width    bytes per row
+   //   word7 height   number of rows (1 => linear copy)
+   typedef struct packed {
+      logic [31:0] height;      // word7  [255:224]
+      logic [31:0] width;       // word6
+      logic [31:0] dst_pitch;   // word5
+      logic [31:0] src_pitch;   // word4
+      logic [31:0] dst_addr;    // word3
+      logic [31:0] src_addr;    // word2
+      logic [31:0] seqno;       // word1
+      logic [31:0] opflags;     // word0  [31:0]
+   } dma_desc_t;
+
+   localparam int DMA_DESC_WORDS = 8;
+
 endpackage : vctrl_pkg
