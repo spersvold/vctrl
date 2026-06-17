@@ -59,45 +59,45 @@ module vctrl_dma import vctrl_pkg::*;
     // ----------------------------------------------------------------------
     // AXI4 read master -- source
     // ----------------------------------------------------------------------
-    output logic [ID_WIDTH-1:0]        m_axi_rd_arid,
-    output logic [ADDR_WIDTH-1:0]      m_axi_rd_araddr,
-    output logic [7:0]                 m_axi_rd_arlen,
-    output logic [2:0]                 m_axi_rd_arsize,
-    output logic [1:0]                 m_axi_rd_arburst,
-    output logic                       m_axi_rd_arlock,
-    output logic [3:0]                 m_axi_rd_arcache,
-    output logic [2:0]                 m_axi_rd_arprot,
-    output logic                       m_axi_rd_arvalid,
-    input  logic                       m_axi_rd_arready,
-    input  logic [ID_WIDTH-1:0]        m_axi_rd_rid,
-    input  logic [AXI_DATA_WIDTH-1:0]  m_axi_rd_rdata,
-    input  logic [1:0]                 m_axi_rd_rresp,
-    input  logic                       m_axi_rd_rlast,
-    input  logic                       m_axi_rd_rvalid,
-    output logic                       m_axi_rd_rready,
+    output logic [ID_WIDTH-1:0]        m_axi_arid,
+    output logic [ADDR_WIDTH-1:0]      m_axi_araddr,
+    output logic [7:0]                 m_axi_arlen,
+    output logic [2:0]                 m_axi_arsize,
+    output logic [1:0]                 m_axi_arburst,
+    output logic                       m_axi_arlock,
+    output logic [3:0]                 m_axi_arcache,
+    output logic [2:0]                 m_axi_arprot,
+    output logic                       m_axi_arvalid,
+    input  logic                       m_axi_arready,
+    input  logic [ID_WIDTH-1:0]        m_axi_rid,
+    input  logic [AXI_DATA_WIDTH-1:0]  m_axi_rdata,
+    input  logic [1:0]                 m_axi_rresp,
+    input  logic                       m_axi_rlast,
+    input  logic                       m_axi_rvalid,
+    output logic                       m_axi_rready,
 
     // ----------------------------------------------------------------------
     // AXI4 write master -- destination
     // ----------------------------------------------------------------------
-    output logic [ID_WIDTH-1:0]        m_axi_wr_awid,
-    output logic [ADDR_WIDTH-1:0]      m_axi_wr_awaddr,
-    output logic [7:0]                 m_axi_wr_awlen,
-    output logic [2:0]                 m_axi_wr_awsize,
-    output logic [1:0]                 m_axi_wr_awburst,
-    output logic                       m_axi_wr_awlock,
-    output logic [3:0]                 m_axi_wr_awcache,
-    output logic [2:0]                 m_axi_wr_awprot,
-    output logic                       m_axi_wr_awvalid,
-    input  logic                       m_axi_wr_awready,
-    output logic [AXI_DATA_WIDTH-1:0]  m_axi_wr_wdata,
-    output logic [STRB_WIDTH-1:0]      m_axi_wr_wstrb,
-    output logic                       m_axi_wr_wlast,
-    output logic                       m_axi_wr_wvalid,
-    input  logic                       m_axi_wr_wready,
-    input  logic [ID_WIDTH-1:0]        m_axi_wr_bid,
-    input  logic [1:0]                 m_axi_wr_bresp,
-    input  logic                       m_axi_wr_bvalid,
-    output logic                       m_axi_wr_bready
+    output logic [ID_WIDTH-1:0]        m_axi_awid,
+    output logic [ADDR_WIDTH-1:0]      m_axi_awaddr,
+    output logic [7:0]                 m_axi_awlen,
+    output logic [2:0]                 m_axi_awsize,
+    output logic [1:0]                 m_axi_awburst,
+    output logic                       m_axi_awlock,
+    output logic [3:0]                 m_axi_awcache,
+    output logic [2:0]                 m_axi_awprot,
+    output logic                       m_axi_awvalid,
+    input  logic                       m_axi_awready,
+    output logic [AXI_DATA_WIDTH-1:0]  m_axi_wdata,
+    output logic [STRB_WIDTH-1:0]      m_axi_wstrb,
+    output logic                       m_axi_wlast,
+    output logic                       m_axi_wvalid,
+    input  logic                       m_axi_wready,
+    input  logic [ID_WIDTH-1:0]        m_axi_bid,
+    input  logic [1:0]                 m_axi_bresp,
+    input  logic                       m_axi_bvalid,
+    output logic                       m_axi_bready
     );
 
    // soft reset (CSR-driven) folds into the datapath reset, not the CSRs
@@ -190,7 +190,7 @@ module vctrl_dma import vctrl_pkg::*;
    // ----------------------------------------------------------------------
    // Copy FIFO : source read master fills (except during a fetch), dest drains
    // ----------------------------------------------------------------------
-   wire                       fifo_wen = m_axi_rd_rvalid & m_axi_rd_rready & ~fetching;
+   wire                       fifo_wen = m_axi_rvalid & m_axi_rready & ~fetching;
    wire [FIFO_LGDEPTH:0]      fifo_fill;
    wire                       fifo_ren;
    wire [AXI_DATA_WIDTH-1:0]  fifo_dout;
@@ -203,7 +203,7 @@ module vctrl_dma import vctrl_pkg::*;
      (.clk   (clk_sys),
       .rst   (rst_dp),
       .wen   (fifo_wen),
-      .din   (m_axi_rd_rdata),
+      .din   (m_axi_rdata),
       .full  (),
       .fill  (fifo_fill),
       .ren   (fifo_ren),
@@ -246,8 +246,8 @@ module vctrl_dma import vctrl_pkg::*;
         ST_FETCH: state <= ST_FETCH_WAIT;   // rd_start issued this cycle
 
         ST_FETCH_WAIT: begin
-           if (m_axi_rd_rvalid & m_axi_rd_rready)
-             fetch_beat <= m_axi_rd_rdata;
+           if (m_axi_rvalid & m_axi_rready)
+             fetch_beat <= m_axi_rdata;
            if (rd_done) begin
               cur_desc  <= dma_desc_t'(fetch_beat);
               from_ring <= 1'b1;
@@ -321,19 +321,20 @@ module vctrl_dma import vctrl_pkg::*;
       .busy          (rd_busy),
       .done          (rd_done),
       .fifo_fill     (fifo_fill),
-      .m_axi_arid    (m_axi_rd_arid),
-      .m_axi_araddr  (m_axi_rd_araddr),
-      .m_axi_arlen   (m_axi_rd_arlen),
-      .m_axi_arsize  (m_axi_rd_arsize),
-      .m_axi_arburst (m_axi_rd_arburst),
-      .m_axi_arlock  (m_axi_rd_arlock),
-      .m_axi_arcache (m_axi_rd_arcache),
-      .m_axi_arprot  (m_axi_rd_arprot),
-      .m_axi_arvalid (m_axi_rd_arvalid),
-      .m_axi_arready (m_axi_rd_arready),
-      .m_axi_rvalid  (m_axi_rd_rvalid),
-      .m_axi_rlast   (m_axi_rd_rlast),
-      .m_axi_rready  (m_axi_rd_rready));
+      .m_axi_arid,
+      .m_axi_araddr,
+      .m_axi_arlen,
+      .m_axi_arsize,
+      .m_axi_arburst,
+      .m_axi_arlock,
+      .m_axi_arcache,
+      .m_axi_arprot,
+      .m_axi_arvalid,
+      .m_axi_arready,
+      .m_axi_rvalid,
+      .m_axi_rlast,
+      .m_axi_rready
+      );
 
    // ----------------------------------------------------------------------
    // Destination write master
@@ -355,24 +356,25 @@ module vctrl_dma import vctrl_pkg::*;
       .fifo_rd       (fifo_ren),
       .fifo_dout     (fifo_dout),
       .fifo_empty    (fifo_empty),
-      .m_axi_awid    (m_axi_wr_awid),
-      .m_axi_awaddr  (m_axi_wr_awaddr),
-      .m_axi_awlen   (m_axi_wr_awlen),
-      .m_axi_awsize  (m_axi_wr_awsize),
-      .m_axi_awburst (m_axi_wr_awburst),
-      .m_axi_awlock  (m_axi_wr_awlock),
-      .m_axi_awcache (m_axi_wr_awcache),
-      .m_axi_awprot  (m_axi_wr_awprot),
-      .m_axi_awvalid (m_axi_wr_awvalid),
-      .m_axi_awready (m_axi_wr_awready),
-      .m_axi_wdata   (m_axi_wr_wdata),
-      .m_axi_wstrb   (m_axi_wr_wstrb),
-      .m_axi_wlast   (m_axi_wr_wlast),
-      .m_axi_wvalid  (m_axi_wr_wvalid),
-      .m_axi_wready  (m_axi_wr_wready),
-      .m_axi_bid     (m_axi_wr_bid),
-      .m_axi_bresp   (m_axi_wr_bresp),
-      .m_axi_bvalid  (m_axi_wr_bvalid),
-      .m_axi_bready  (m_axi_wr_bready));
+      .m_axi_awid,
+      .m_axi_awaddr,
+      .m_axi_awlen,
+      .m_axi_awsize,
+      .m_axi_awburst,
+      .m_axi_awlock,
+      .m_axi_awcache,
+      .m_axi_awprot,
+      .m_axi_awvalid,
+      .m_axi_awready,
+      .m_axi_wdata,
+      .m_axi_wstrb,
+      .m_axi_wlast,
+      .m_axi_wvalid,
+      .m_axi_wready,
+      .m_axi_bid,
+      .m_axi_bresp,
+      .m_axi_bvalid,
+      .m_axi_bready
+      );
 
 endmodule // vctrl_dma

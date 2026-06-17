@@ -122,10 +122,10 @@ module tb
 
 
     // ----------------------------------------------------------------------
-    // AXI4 read master (write channel tied idle)
+    // AXI4 read-only master
     // ----------------------------------------------------------------------
    localparam AXI_ID_WIDTH   = 1;
-   localparam AXI_ADDR_WIDTH = 32;
+   localparam AXI_ADDR_WIDTH = 24;
    localparam AXI_DATA_WIDTH = 256;
    localparam AXI_STRB_WIDTH = AXI_DATA_WIDTH/8;
 
@@ -145,7 +145,7 @@ module tb
    logic                           m_axi_rlast;
    logic                           m_axi_rvalid;
    logic                           m_axi_rready;
-   //
+   // destination write master <-> u_dst
    logic [AXI_ID_WIDTH-1:0]        m_axi_awid;
    logic [AXI_ADDR_WIDTH-1:0]      m_axi_awaddr;
    logic [7:0]                     m_axi_awlen;
@@ -177,8 +177,8 @@ module tb
    u_axim
      (.clk         (clk_sys),
       .rst         (rst_sys),
-      .fb_base     ({vbar, 2'b00}),
-      .fb_size     ({vsiz, 2'b00}),
+      .fb_base     ({vbar[23:2], 2'b00}),
+      .fb_size     ({vsiz[23:2], 2'b00}),
       // others
       .*);
 
@@ -188,7 +188,7 @@ module tb
       .STRB_WIDTH (AXI_STRB_WIDTH),
       .ID_WIDTH   (AXI_ID_WIDTH),
       .PIPELINE_OUTPUT (1))
-   u_ram
+   u_dst
      (.clk           (clk_sys),
       .rst           (rst_sys),
       .s_axi_awid    (m_axi_awid),
@@ -232,7 +232,6 @@ module tb
    // DMA engine DUT (+TESTCASE=dma) : source and destination AXI memories.
    // A small 24-bit address space keeps each axi_ram model at 16 MiB.
    // ----------------------------------------------------------------------
-   localparam DMA_ADDR_WIDTH = 24;
    localparam DMA_RESP_LAT   = 12;   // fixed source/dest memory response latency (cycles)
 
    logic                       cmd_req;
@@ -250,7 +249,7 @@ module tb
 
    // source read master <-> u_src
    logic [AXI_ID_WIDTH  -1:0]  rd_arid;
-   logic [DMA_ADDR_WIDTH-1:0]  rd_araddr;
+   logic [AXI_ADDR_WIDTH-1:0]  rd_araddr;
    logic [7:0]                 rd_arlen;
    logic [2:0]                 rd_arsize;
    logic [1:0]                 rd_arburst;
@@ -263,79 +262,64 @@ module tb
    logic [1:0]                 rd_rresp;
    logic                       rd_rlast, rd_rvalid, rd_rready;
 
-   // destination write master <-> u_dst
-   logic [AXI_ID_WIDTH  -1:0]  wr_awid;
-   logic [DMA_ADDR_WIDTH-1:0]  wr_awaddr;
-   logic [7:0]                 wr_awlen;
-   logic [2:0]                 wr_awsize;
-   logic [1:0]                 wr_awburst;
-   logic                       wr_awlock;
-   logic [3:0]                 wr_awcache;
-   logic [2:0]                 wr_awprot;
-   logic                       wr_awvalid, wr_awready;
-   logic [AXI_DATA_WIDTH-1:0]  wr_wdata;
-   logic [AXI_STRB_WIDTH-1:0]  wr_wstrb;
-   logic                       wr_wlast, wr_wvalid, wr_wready;
-   logic [AXI_ID_WIDTH  -1:0]  wr_bid;
-   logic [1:0]                 wr_bresp;
-   logic                       wr_bvalid, wr_bready;
-
    vctrl_dma #
-     (.ADDR_WIDTH     (DMA_ADDR_WIDTH),
+     (.ADDR_WIDTH     (AXI_ADDR_WIDTH),
       .AXI_DATA_WIDTH (AXI_DATA_WIDTH),
       .ID_WIDTH       (AXI_ID_WIDTH),
       .BURST_LEN      (16),
       .FIFO_LGDEPTH   (9))
    u_dma
-     (.clk_sys          (clk_sys),
-      .rst_sys          (rst_sys),
-      .cmd_req          (cmd_req),
-      .cmd_adr          (cmd_adr),
-      .cmd_we           (cmd_we),
-      .cmd_be           (cmd_be),
-      .cmd_d            (cmd_d),
-      .cmd_q            (cmd_q),
-      .cmd_ack          (cmd_ack),
-      .irq              (dma_irq),
-      .m_axi_rd_arid    (rd_arid),
-      .m_axi_rd_araddr  (rd_araddr),
-      .m_axi_rd_arlen   (rd_arlen),
-      .m_axi_rd_arsize  (rd_arsize),
-      .m_axi_rd_arburst (rd_arburst),
-      .m_axi_rd_arlock  (rd_arlock),
-      .m_axi_rd_arcache (rd_arcache),
-      .m_axi_rd_arprot  (rd_arprot),
-      .m_axi_rd_arvalid (rd_arvalid),
-      .m_axi_rd_arready (rd_arready),
-      .m_axi_rd_rid     (rd_rid),
-      .m_axi_rd_rdata   (rd_rdata),
-      .m_axi_rd_rresp   (rd_rresp),
-      .m_axi_rd_rlast   (rd_rlast),
-      .m_axi_rd_rvalid  (rd_rvalid),
-      .m_axi_rd_rready  (rd_rready),
-      .m_axi_wr_awid    (wr_awid),
-      .m_axi_wr_awaddr  (wr_awaddr),
-      .m_axi_wr_awlen   (wr_awlen),
-      .m_axi_wr_awsize  (wr_awsize),
-      .m_axi_wr_awburst (wr_awburst),
-      .m_axi_wr_awlock  (wr_awlock),
-      .m_axi_wr_awcache (wr_awcache),
-      .m_axi_wr_awprot  (wr_awprot),
-      .m_axi_wr_awvalid (wr_awvalid),
-      .m_axi_wr_awready (wr_awready),
-      .m_axi_wr_wdata   (wr_wdata),
-      .m_axi_wr_wstrb   (wr_wstrb),
-      .m_axi_wr_wlast   (wr_wlast),
-      .m_axi_wr_wvalid  (wr_wvalid),
-      .m_axi_wr_wready  (wr_wready),
-      .m_axi_wr_bid     (wr_bid),
-      .m_axi_wr_bresp   (wr_bresp),
-      .m_axi_wr_bvalid  (wr_bvalid),
-      .m_axi_wr_bready  (wr_bready));
+     (.clk_sys       (clk_sys),
+      .rst_sys       (rst_sys),
+      .cmd_req       (cmd_req),
+      .cmd_adr       (cmd_adr),
+      .cmd_we        (cmd_we),
+      .cmd_be        (cmd_be),
+      .cmd_d         (cmd_d),
+      .cmd_q         (cmd_q),
+      .cmd_ack       (cmd_ack),
+      .irq           (dma_irq),
+      .m_axi_arid    (rd_arid),
+      .m_axi_araddr  (rd_araddr),
+      .m_axi_arlen   (rd_arlen),
+      .m_axi_arsize  (rd_arsize),
+      .m_axi_arburst (rd_arburst),
+      .m_axi_arlock  (rd_arlock),
+      .m_axi_arcache (rd_arcache),
+      .m_axi_arprot  (rd_arprot),
+      .m_axi_arvalid (rd_arvalid),
+      .m_axi_arready (rd_arready),
+      .m_axi_rid     (rd_rid),
+      .m_axi_rdata   (rd_rdata),
+      .m_axi_rresp   (rd_rresp),
+      .m_axi_rlast   (rd_rlast),
+      .m_axi_rvalid  (rd_rvalid),
+      .m_axi_rready  (rd_rready),
+      .m_axi_awid,
+      .m_axi_awaddr,
+      .m_axi_awlen,
+      .m_axi_awsize,
+      .m_axi_awburst,
+      .m_axi_awlock,
+      .m_axi_awcache,
+      .m_axi_awprot,
+      .m_axi_awvalid,
+      .m_axi_awready,
+      .m_axi_wdata,
+      .m_axi_wstrb,
+      .m_axi_wlast,
+      .m_axi_wvalid,
+      .m_axi_wready,
+      .m_axi_bid,
+      .m_axi_bresp,
+      .m_axi_bvalid,
+      .m_axi_bready
+      );
+
 
    axi_ram #
      (.DATA_WIDTH      (AXI_DATA_WIDTH),
-      .ADDR_WIDTH      (DMA_ADDR_WIDTH),
+      .ADDR_WIDTH      (AXI_ADDR_WIDTH),
       .STRB_WIDTH      (AXI_STRB_WIDTH),
       .ID_WIDTH        (AXI_ID_WIDTH),
       .PIPELINE_OUTPUT (1),
@@ -378,52 +362,6 @@ module tb
       .s_axi_rlast   (rd_rlast),
       .s_axi_rvalid  (rd_rvalid),
       .s_axi_rready  (rd_rready));
-
-   axi_ram #
-     (.DATA_WIDTH      (AXI_DATA_WIDTH),
-      .ADDR_WIDTH      (DMA_ADDR_WIDTH),
-      .STRB_WIDTH      (AXI_STRB_WIDTH),
-      .ID_WIDTH        (AXI_ID_WIDTH),
-      .PIPELINE_OUTPUT (1),
-      .RESP_LATENCY    (DMA_RESP_LAT))
-   u_dst   // answers the write master; read side idle
-     (.clk           (clk_sys),
-      .rst           (rst_sys),
-      .s_axi_awid    (wr_awid),
-      .s_axi_awaddr  (wr_awaddr),
-      .s_axi_awlen   (wr_awlen),
-      .s_axi_awsize  (wr_awsize),
-      .s_axi_awburst (wr_awburst),
-      .s_axi_awlock  (wr_awlock),
-      .s_axi_awcache (wr_awcache),
-      .s_axi_awprot  (wr_awprot),
-      .s_axi_awvalid (wr_awvalid),
-      .s_axi_awready (wr_awready),
-      .s_axi_wdata   (wr_wdata),
-      .s_axi_wstrb   (wr_wstrb),
-      .s_axi_wlast   (wr_wlast),
-      .s_axi_wvalid  (wr_wvalid),
-      .s_axi_wready  (wr_wready),
-      .s_axi_bid     (wr_bid),
-      .s_axi_bresp   (wr_bresp),
-      .s_axi_bvalid  (wr_bvalid),
-      .s_axi_bready  (wr_bready),
-      .s_axi_arid    ('0),
-      .s_axi_araddr  ('0),
-      .s_axi_arlen   ('0),
-      .s_axi_arsize  ('0),
-      .s_axi_arburst ('0),
-      .s_axi_arlock  ('0),
-      .s_axi_arcache ('0),
-      .s_axi_arprot  ('0),
-      .s_axi_arvalid (1'b0),
-      .s_axi_arready (),
-      .s_axi_rid     (),
-      .s_axi_rdata   (),
-      .s_axi_rresp   (),
-      .s_axi_rlast   (),
-      .s_axi_rvalid  (),
-      .s_axi_rready  (1'b0));
 
    //
 

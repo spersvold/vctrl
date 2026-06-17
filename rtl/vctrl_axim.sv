@@ -67,7 +67,7 @@ module vctrl_axim
     output logic                       fb_rvalid,
 
     // ----------------------------------------------------------------------
-    // AXI4 read master (write channel tied idle)
+    // AXI4 read-only master
     // ----------------------------------------------------------------------
     output logic [ID_WIDTH-1:0]        m_axi_arid,
     output logic [ADDR_WIDTH-1:0]      m_axi_araddr,
@@ -84,27 +84,7 @@ module vctrl_axim
     input  logic [1:0]                 m_axi_rresp,
     input  logic                       m_axi_rlast,
     input  logic                       m_axi_rvalid,
-    output logic                       m_axi_rready,
-    //
-    output logic [ID_WIDTH-1:0]        m_axi_awid,
-    output logic [ADDR_WIDTH-1:0]      m_axi_awaddr,
-    output logic [7:0]                 m_axi_awlen,
-    output logic [2:0]                 m_axi_awsize,
-    output logic [1:0]                 m_axi_awburst,
-    output logic                       m_axi_awlock,
-    output logic [3:0]                 m_axi_awcache,
-    output logic [2:0]                 m_axi_awprot,
-    output logic                       m_axi_awvalid,
-    input  logic                       m_axi_awready,
-    output logic [AXI_DATA_WIDTH-1:0]  m_axi_wdata,
-    output logic [STRB_WIDTH-1:0]      m_axi_wstrb,
-    output logic                       m_axi_wlast,
-    output logic                       m_axi_wvalid,
-    input  logic                       m_axi_wready,
-    input  logic [ID_WIDTH-1:0]        m_axi_bid,
-    input  logic [1:0]                 m_axi_bresp,
-    input  logic                       m_axi_bvalid,
-    output logic                       m_axi_bready
+    output logic                       m_axi_rready
     );
 
    localparam logic [1:0] BURST_INCR = 2'b01;
@@ -282,23 +262,5 @@ module vctrl_axim
          fb_rvalid  <= 1'b0;
       end
    end
-
-   // ========================================================================
-   // Write channel : unused (read-only master)
-   // ========================================================================
-   assign m_axi_awid    = '0;
-   assign m_axi_awaddr  = '0;
-   assign m_axi_awlen   = '0;
-   assign m_axi_awsize  = '0;
-   assign m_axi_awburst = '0;
-   assign m_axi_awlock  = 1'b0;
-   assign m_axi_awcache = '0;
-   assign m_axi_awprot  = '0;
-   assign m_axi_awvalid = 1'b0;
-   assign m_axi_wdata   = '0;
-   assign m_axi_wstrb   = '0;
-   assign m_axi_wlast   = 1'b0;
-   assign m_axi_wvalid  = 1'b0;
-   assign m_axi_bready  = 1'b1;
 
 endmodule // vctrl_axim
