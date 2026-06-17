@@ -107,13 +107,18 @@ module vctrl_dma import vctrl_pkg::*;
    // ----------------------------------------------------------------------
    // CSR slave <-> FSM
    // ----------------------------------------------------------------------
-   dma_desc_t  desc;
-   logic       desc_go;
-   logic       dma_enable;
-   logic       busy, idle;
-   logic [7:0] fsm_state;
+   dma_desc_t   desc;
+   logic        desc_go;
+   logic        dma_enable;
+   logic        dma_ring_en;
+   logic [31:0] ring_base;
+   logic [ 4:0] ring_size;
+   logic [31:0] ring_tail;
+   logic [31:0] ring_head;
+   logic        busy, idle;
+   logic [ 7:0] fsm_state;
    logic [31:0] fence_seqno_r;
-   logic       done_set;
+   logic        done_set;
 
    vctrl_dma_regs u_regs
      (.clk_sys     (clk_sys),
@@ -127,11 +132,16 @@ module vctrl_dma import vctrl_pkg::*;
       .cmd_ack     (cmd_ack),
       .dma_enable  (dma_enable),
       .dma_soft_rst(dma_soft_rst),
+      .dma_ring_en (dma_ring_en),
       .desc        (desc),
       .desc_go     (desc_go),
+      .ring_base   (ring_base),
+      .ring_size   (ring_size),
+      .ring_tail   (ring_tail),
+      .ring_head   (ring_head),
       .busy        (busy),
       .idle        (idle),
-      .dma_error   (1'b0),         // no error path in Phase 1a
+      .dma_error   (1'b0),         // no error path yet
       .state       (fsm_state),
       .fence_seqno (fence_seqno_r),
       .err_info    (32'h0),
@@ -140,9 +150,38 @@ module vctrl_dma import vctrl_pkg::*;
       .irq         (irq));
 
    // ----------------------------------------------------------------------
-   // Copy FIFO : source read master fills, destination write master drains
+   // Command FSM state. Declared up front because the copy FIFO write is
+   // gated off during a descriptor fetch -- the fetch reuses the source read
+   // master to read one beat (= one descriptor) from the ring.
    // ----------------------------------------------------------------------
-   wire                       fifo_wen = m_axi_rd_rvalid & m_axi_rd_rready;
+   typedef enum logic [2:0] {
+      ST_IDLE       = 3'd0,
+      ST_FETCH      = 3'd1,   // issue a one-beat descriptor read
+      ST_FETCH_WAIT = 3'd2,   // capture the fetched descriptor
+      ST_DISPATCH   = 3'd3,   // decode + launch the command
+      ST_COPY       = 3'd4,   // wait for the copy to retire
+      ST_COMPLETE   = 3'd5    // advance fence (+ ring head)
+   } dma_state_t;
+   dma_state_t state;
+
+   dma_desc_t                 cur_desc;    // command in flight (PIO or ring entry)
+   logic                      from_ring;   // cur_desc came from the ring
+   logic [AXI_DATA_WIDTH-1:0] fetch_beat;  // captured ring descriptor beat
+
+   wire fetching = (state == ST_FETCH) | (state == ST_FETCH_WAIT);
+
+   wire [7:0]  opcode     = cur_desc.opflags[7:0];
+   wire        is_copy    = (opcode == DMA_OP_COPY2D);
+   wire [31:0] job_nbeats = cur_desc.width >> BEAT_LSB;   // linear: width bytes, height 1
+
+   // ring fetch address: ring_base + (head mod entries) * 32 bytes
+   wire [31:0] ring_mask = (32'd1 << ring_size) - 32'd1;
+   wire [31:0] ring_addr = ring_base + ((ring_head & ring_mask) << BEAT_LSB);
+
+   // ----------------------------------------------------------------------
+   // Copy FIFO : source read master fills (except during a fetch), dest drains
+   // ----------------------------------------------------------------------
+   wire                       fifo_wen = m_axi_rd_rvalid & m_axi_rd_rready & ~fetching;
    wire [FIFO_LGDEPTH:0]      fifo_fill;
    wire                       fifo_ren;
    wire [AXI_DATA_WIDTH-1:0]  fifo_dout;
@@ -163,26 +202,23 @@ module vctrl_dma import vctrl_pkg::*;
       .empty (fifo_empty));
 
    // ----------------------------------------------------------------------
-   // Command FSM
+   // Read / write master controls. rd serves both the descriptor fetch (one
+   // beat) and the copy source (job beats); the FSM never overlaps them.
    // ----------------------------------------------------------------------
-   typedef enum logic [1:0] { ST_IDLE = 2'd0, ST_RUN = 2'd1 } dma_state_t;
-   dma_state_t state;
+   logic rd_busy, rd_done;
+   logic wr_busy, wr_done;
 
-   wire [7:0]   opcode     = desc.opflags[7:0];
-   wire         is_copy    = (opcode == DMA_OP_COPY2D);
-   wire [31:0]  job_nbeats = desc.width >> BEAT_LSB;     // linear: width bytes, height 1
+   wire                 rd_start  = (state == ST_FETCH) |
+                                    ((state == ST_DISPATCH) & is_copy);
+   wire                 wr_start  = (state == ST_DISPATCH) & is_copy;
+   wire [ADDR_WIDTH-1:0] rd_base  = fetching ? ring_addr[ADDR_WIDTH-1:0]
+                                             : cur_desc.src_addr[ADDR_WIDTH-1:0];
+   wire [31:0]          rd_nbeats = fetching ? 32'd1 : job_nbeats;
+   wire [ADDR_WIDTH-1:0] wr_base  = cur_desc.dst_addr[ADDR_WIDTH-1:0];
 
-   logic [31:0] job_seqno_r;
-   logic        rd_start, rd_busy, rd_done;
-   logic        wr_start, wr_busy, wr_done;
-
-   // launch both engines off the doorbell for a copy
-   assign rd_start = (state == ST_IDLE) & desc_go & dma_enable & is_copy;
-   assign wr_start = rd_start;
-
-   assign busy      = (state == ST_RUN);
+   assign busy      = (state != ST_IDLE);
    assign idle      = (state == ST_IDLE) & ~rd_busy & ~wr_busy;
-   assign fsm_state = {6'h0, state};
+   assign fsm_state = {5'h0, state};
 
    always_ff @(posedge clk_sys) begin
       done_set <= 1'b0;
@@ -190,23 +226,39 @@ module vctrl_dma import vctrl_pkg::*;
       unique case (state)
         ST_IDLE: begin
            if (desc_go & dma_enable) begin
-              if (is_copy)
-                state <= ST_RUN;
-              else begin
-                 // NOP / FENCE / (unimplemented): complete immediately
-                 fence_seqno_r <= desc.seqno;
-                 done_set      <= 1'b1;
-              end
+              cur_desc  <= desc;        // PIO submit
+              from_ring <= 1'b0;
+              state     <= ST_DISPATCH;
+           end
+           else if (dma_enable & dma_ring_en & (ring_tail != ring_head)) begin
+              state <= ST_FETCH;        // the ring has work
            end
         end
-        ST_RUN: begin
+
+        ST_FETCH: state <= ST_FETCH_WAIT;   // rd_start issued this cycle
+
+        ST_FETCH_WAIT: begin
+           if (m_axi_rd_rvalid & m_axi_rd_rready)
+             fetch_beat <= m_axi_rd_rdata;
+           if (rd_done) begin
+              cur_desc  <= dma_desc_t'(fetch_beat);
+              from_ring <= 1'b1;
+              state     <= ST_DISPATCH;
+           end
+        end
+
+        ST_DISPATCH: state <= is_copy ? ST_COPY : ST_COMPLETE;
+
+        ST_COPY: if (wr_done) state <= ST_COMPLETE;
+
+        ST_COMPLETE: begin
            // write retiring last (B received) is the true completion
-           if (wr_done) begin
-              fence_seqno_r <= job_seqno_r;
-              done_set      <= 1'b1;
-              state         <= ST_IDLE;
-           end
+           fence_seqno_r <= cur_desc.seqno;
+           done_set      <= 1'b1;
+           if (from_ring) ring_head <= ring_head + 1'b1;
+           state         <= ST_IDLE;
         end
+
         default: state <= ST_IDLE;
       endcase
 
@@ -214,16 +266,10 @@ module vctrl_dma import vctrl_pkg::*;
          state         <= ST_IDLE;
          fence_seqno_r <= '0;
          done_set      <= 1'b0;
+         ring_head     <= '0;
+         from_ring     <= 1'b0;
       end
    end
-
-   // latch the in-flight seqno so the right fence is reported even if the
-   // descriptor registers are rewritten while the copy runs
-   always_ff @(posedge clk_sys)
-     if (rst_dp)
-       job_seqno_r <= '0;
-     else if (rd_start)
-       job_seqno_r <= desc.seqno;
 
    // ----------------------------------------------------------------------
    // Source read master
@@ -238,8 +284,8 @@ module vctrl_dma import vctrl_pkg::*;
      (.clk           (clk_sys),
       .rst           (rst_dp),
       .start         (rd_start),
-      .base          (desc.src_addr[ADDR_WIDTH-1:0]),
-      .nbeats        (job_nbeats),
+      .base          (rd_base),
+      .nbeats        (rd_nbeats),
       .busy          (rd_busy),
       .done          (rd_done),
       .fifo_fill     (fifo_fill),
@@ -269,7 +315,7 @@ module vctrl_dma import vctrl_pkg::*;
      (.clk           (clk_sys),
       .rst           (rst_dp),
       .start         (wr_start),
-      .base          (desc.dst_addr[ADDR_WIDTH-1:0]),
+      .base          (wr_base),
       .nbeats        (job_nbeats),
       .busy          (wr_busy),
       .done          (wr_done),

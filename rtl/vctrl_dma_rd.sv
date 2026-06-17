@@ -97,7 +97,10 @@ module vctrl_dma_rd
    // reserve for the registration lag (the hardened scanout idiom).
    wire room_for_burst = (out_beats + {1'b0, fifo_fill} + CNTW'(2*BURST_LEN)) <= CNTW'(FIFO_DEPTH);
 
-   wire all_done   = running & (beats_left == '0) & (out_beats == '0);
+   // done only once nothing is outstanding: no more to request, no accepted
+   // beats in flight, and no AR still awaiting acceptance (~arvalid) -- the
+   // latter guards a single-burst read whose AR is launched but not yet taken
+   wire all_done   = running & (beats_left == '0) & (out_beats == '0) & ~m_axi_arvalid;
    wire can_launch = running & (beats_left != '0) & room_for_burst & ~ar_pending;
 
    assign busy          = running;

@@ -138,6 +138,7 @@ package vctrl_pkg;
    // DMA_CTRL bit positions
    localparam int DMA_CTRL_ENABLE = 0;   // engine enable
    localparam int DMA_CTRL_RESET  = 1;   // soft reset (self-clearing)
+   localparam int DMA_CTRL_RINGEN = 2;   // process the in-memory command ring
 
    // DMA_STATUS bit positions ([11:4] = FSM state, debug)
    localparam int DMA_STAT_BUSY   = 0;   // a command is executing

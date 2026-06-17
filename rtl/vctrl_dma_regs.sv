@@ -40,8 +40,12 @@ module vctrl_dma_regs import vctrl_pkg::*;
    // ----------------------------------------------------------------------
    output logic         dma_enable,   // CTRL.enable level
    output logic         dma_soft_rst, // CTRL.reset, one-cycle pulse
+   output logic         dma_ring_en,  // CTRL.ring_en level
    output dma_desc_t    desc,         // current PIO descriptor
    output logic         desc_go,      // one-cycle pulse: execute `desc`
+   output logic [31: 0] ring_base,    // ring base byte address
+   output logic [ 4: 0] ring_size,    // log2(ring entries)
+   output logic [31: 0] ring_tail,    // producer tail (doorbell write)
 
    // ----------------------------------------------------------------------
    // Status plane from the datapath / FSM
@@ -54,6 +58,7 @@ module vctrl_dma_regs import vctrl_pkg::*;
    input  logic [31: 0] err_info,     // error info (resp / fault addr)
    input  logic         done_set,     // one-cycle: command completed
    input  logic         err_set,      // one-cycle: command faulted
+   input  logic [31: 0] ring_head,    // consumer head (from FSM)
 
    // ----------------------------------------------------------------------
    // Interrupt
@@ -90,8 +95,12 @@ module vctrl_dma_regs import vctrl_pkg::*;
           desc         <= '0;
           dma_enable   <= 1'b0;
           dma_soft_rst <= 1'b0;
+          dma_ring_en  <= 1'b0;
           desc_go      <= 1'b0;
           irq_en       <= '0;
+          ring_base    <= '0;
+          ring_size    <= '0;
+          ring_tail    <= '0;
        end
      else
        begin
@@ -104,6 +113,7 @@ module vctrl_dma_regs import vctrl_pkg::*;
               DMA_CTRL_ADR     : begin
                  dma_enable   <= cmd_d[DMA_CTRL_ENABLE];
                  dma_soft_rst <= cmd_d[DMA_CTRL_RESET];
+                 dma_ring_en  <= cmd_d[DMA_CTRL_RINGEN];
               end
               DMA_IRQEN_ADR    : irq_en         <= cmd_d[1:0];
               DMA_SRC_ADR      : desc.src_addr  <= cmd_d;
@@ -117,6 +127,9 @@ module vctrl_dma_regs import vctrl_pkg::*;
                  desc.seqno <= cmd_d;  // fence value to report on completion
                  desc_go    <= 1'b1;   // kick the FSM with the current descriptor
               end
+              DMA_RINGBASE_ADR : ring_base <= cmd_d;
+              DMA_RINGSIZE_ADR : ring_size <= cmd_d[4:0];
+              DMA_RINGTAIL_ADR : ring_tail <= cmd_d;
               default:;
             endcase
        end
@@ -148,7 +161,7 @@ module vctrl_dma_regs import vctrl_pkg::*;
    always_comb
      unique casez (reg_adr)
        DMA_ID_ADR       : reg_dato = DMA_IDENT;
-       DMA_CTRL_ADR     : reg_dato = {31'h0, dma_enable};
+       DMA_CTRL_ADR     : reg_dato = {29'h0, dma_ring_en, 1'b0, dma_enable};
        DMA_STATUS_ADR   : reg_dato = {20'h0, state, 1'b0, dma_error, idle, busy};
        DMA_IRQ_ADR      : reg_dato = {30'h0, irq_status};
        DMA_IRQEN_ADR    : reg_dato = {30'h0, irq_en};
@@ -161,6 +174,10 @@ module vctrl_dma_regs import vctrl_pkg::*;
        DMA_OP_ADR       : reg_dato = desc.opflags;
        DMA_FENCE_ADR    : reg_dato = fence_seqno;
        DMA_ERR_ADR      : reg_dato = err_info;
+       DMA_RINGBASE_ADR : reg_dato = ring_base;
+       DMA_RINGSIZE_ADR : reg_dato = {27'h0, ring_size};
+       DMA_RINGTAIL_ADR : reg_dato = ring_tail;
+       DMA_RINGHEAD_ADR : reg_dato = ring_head;
        default          : reg_dato = 32'h0000_0000;
      endcase
 

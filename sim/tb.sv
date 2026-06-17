@@ -479,9 +479,10 @@ module tb
          $display("%t INFO: Running testcase '%s'", $time, testcase);
 
          case (testcase)
-           "scanout": test_scanout;
-           "dma"    : test_dma;
-           default  : $error("unknown TESTCASE '%s'", testcase);
+           "scanout" : test_scanout;
+           "dma"     : test_dma;
+           "dma_ring": test_dma_ring;
+           default   : $error("unknown TESTCASE '%s'", testcase);
          endcase
 
          #100ns;

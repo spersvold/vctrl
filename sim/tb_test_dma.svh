@@ -30,6 +30,10 @@
    localparam DMA_OP_OFF       = 'h38;
    localparam DMA_DOORBELL_OFF = 'h3C;
    localparam DMA_FENCE_OFF    = 'h40;
+   localparam DMA_RINGBASE_OFF = 'h50;
+   localparam DMA_RINGSIZE_OFF = 'h54;
+   localparam DMA_RINGTAIL_OFF = 'h58;
+   localparam DMA_RINGHEAD_OFF = 'h5C;
 
    // copy parameters: 100 beats exercises 6 full bursts + a short final burst
    localparam int          DMA_TEST_NBEATS = 100;
@@ -127,3 +131,79 @@
            $display("%t ERROR: DMA test failed (%0d mismatched beats)", $time, errors);
       end
    endtask // test_dma
+
+   // ----------------------------------------------------------------------
+   // Ring testcase: a ring of descriptors in source memory, published with a
+   // single RING_TAIL doorbell; the engine fetches and executes each one.
+   // ----------------------------------------------------------------------
+   task test_dma_ring;
+
+      localparam int          NENT     = 4;             // ring entries
+      localparam int          RINGLOG  = 2;             // log2(NENT)
+      localparam logic [31:0] RINGBASE = 32'h0000_0000; // ring (in source mem)
+      localparam logic [31:0] SRCDATA  = 32'h0000_1000; // copy source (source mem)
+      localparam logic [31:0] DSTDATA  = 32'h0000_2000; // copy dest (dest mem)
+      localparam int          CBEATS   = 16;            // beats copied per entry
+      localparam int          CBYTES   = CBEATS * 32;
+      localparam logic [31:0] SEQ0     = 32'h0BAD_0000;
+
+      dma_desc_t   d;
+      logic [31:0] rdata;
+      int          errors, si, di;
+
+      begin
+         // build the copy source data, clear the dest, and lay out the ring
+         for (int e = 0; e < NENT; e++) begin
+            for (int b = 0; b < CBEATS; b++) begin
+               u_src.mem[(SRCDATA >> 5) + e*CBEATS + b] = {8{32'hD000_0000 + 32'(e*256 + b)}};
+               u_dst.mem[(DSTDATA >> 5) + e*CBEATS + b] = '0;
+            end
+            d           = '0;
+            d.opflags   = 32'(DMA_OP_COPY2D);
+            d.seqno     = SEQ0 + 32'(e);
+            d.src_addr  = SRCDATA + 32'(e*CBYTES);
+            d.dst_addr  = DSTDATA + 32'(e*CBYTES);
+            d.src_pitch = CBYTES;
+            d.dst_pitch = CBYTES;
+            d.width     = CBYTES;
+            d.height    = 1;
+            u_src.mem[(RINGBASE >> 5) + e] = d;   // one descriptor = one beat
+         end
+
+         // program the ring and enable ring mode
+         cmd_write(DMA_IRQEN_OFF,    32'h1);
+         cmd_write(DMA_RINGBASE_OFF, RINGBASE);
+         cmd_write(DMA_RINGSIZE_OFF, RINGLOG);
+         cmd_write(DMA_CTRL_OFF,     (32'h1 << DMA_CTRL_ENABLE) | (32'h1 << DMA_CTRL_RINGEN));
+
+         // doorbell: publish all NENT entries (tail = NENT)
+         $display("%t INFO: DMA ring doorbell (%0d entries)", $time, NENT);
+         cmd_write(DMA_RINGTAIL_OFF, NENT);
+
+         // wait until the engine has consumed the whole ring (head == tail)
+         do cmd_read(DMA_RINGHEAD_OFF, rdata); while (rdata != NENT);
+
+         // verify every entry's destination matches its source
+         errors = 0;
+         for (int e = 0; e < NENT; e++)
+           for (int b = 0; b < CBEATS; b++) begin
+              si = (SRCDATA >> 5) + e*CBEATS + b;
+              di = (DSTDATA >> 5) + e*CBEATS + b;
+              if (u_dst.mem[di] !== u_src.mem[si]) begin
+                 errors++;
+                 if (errors <= 4)
+                   $display("  entry %0d beat %0d MISMATCH dst=%h src=%h",
+                            e, b, u_dst.mem[di], u_src.mem[si]);
+              end
+           end
+
+         cmd_read(DMA_FENCE_OFF, rdata);
+         if (errors == 0 && rdata === (SEQ0 + 32'(NENT-1))) begin
+            $display("%t INFO: DMA ring verified (%0d entries x %0d beats, fence=%h)",
+                     $time, NENT, CBEATS, rdata);
+            result = 1'b1;
+         end
+         else
+           $display("%t ERROR: DMA ring failed (%0d mismatches, fence=%h)", $time, errors, rdata);
+      end
+   endtask // test_dma_ring
