@@ -158,21 +158,30 @@ module vctrl_dma import vctrl_pkg::*;
       ST_IDLE       = 3'd0,
       ST_FETCH      = 3'd1,   // issue a one-beat descriptor read
       ST_FETCH_WAIT = 3'd2,   // capture the fetched descriptor
-      ST_DISPATCH   = 3'd3,   // decode + launch the command
-      ST_COPY       = 3'd4,   // wait for the copy to retire
-      ST_COMPLETE   = 3'd5    // advance fence (+ ring head)
+      ST_DISPATCH   = 3'd3,   // decode + set up the row walk
+      ST_ROW_ISSUE  = 3'd4,   // launch rd+wr for one row
+      ST_ROW_WAIT   = 3'd5,   // wait for the row to retire, then next row
+      ST_COMPLETE   = 3'd6    // advance fence (+ ring head)
    } dma_state_t;
    dma_state_t state;
 
-   dma_desc_t                 cur_desc;    // command in flight (PIO or ring entry)
-   logic                      from_ring;   // cur_desc came from the ring
-   logic [AXI_DATA_WIDTH-1:0] fetch_beat;  // captured ring descriptor beat
+   dma_desc_t                 cur_desc;     // command in flight (PIO or ring entry)
+   logic                      from_ring;    // cur_desc came from the ring
+   logic [AXI_DATA_WIDTH-1:0] fetch_beat;   // captured ring descriptor beat
+   logic [31:0]               src_row_addr; // current row source byte address
+   logic [31:0]               dst_row_addr; // current row dest byte address
+   logic [31:0]               rows_left;    // rows still to copy (height down to 0)
 
    wire fetching = (state == ST_FETCH) | (state == ST_FETCH_WAIT);
 
    wire [7:0]  opcode     = cur_desc.opflags[7:0];
    wire        is_copy    = (opcode == DMA_OP_COPY2D);
-   wire [31:0] job_nbeats = cur_desc.width >> BEAT_LSB;   // linear: width bytes, height 1
+   // beats per row = ceil(width / beat); the final beat may be partial and is
+   // masked on the write by wr_last_be (sub-beat / non-beat-aligned widths)
+   wire [31:0]           row_beats  = (cur_desc.width + 32'(STRB_WIDTH-1)) >> BEAT_LSB;
+   wire [STRB_WIDTH-1:0] wr_last_be = (cur_desc.width[BEAT_LSB-1:0] == '0)
+                                    ? {STRB_WIDTH{1'b1}}
+                                    : (STRB_WIDTH'(1) << cur_desc.width[BEAT_LSB-1:0]) - STRB_WIDTH'(1);
 
    // ring fetch address: ring_base + (head mod entries) * 32 bytes
    wire [31:0] ring_mask = (32'd1 << ring_size) - 32'd1;
@@ -208,13 +217,12 @@ module vctrl_dma import vctrl_pkg::*;
    logic rd_busy, rd_done;
    logic wr_busy, wr_done;
 
-   wire                 rd_start  = (state == ST_FETCH) |
-                                    ((state == ST_DISPATCH) & is_copy);
-   wire                 wr_start  = (state == ST_DISPATCH) & is_copy;
+   wire                 rd_start  = (state == ST_FETCH) | (state == ST_ROW_ISSUE);
+   wire                 wr_start  = (state == ST_ROW_ISSUE);
    wire [ADDR_WIDTH-1:0] rd_base  = fetching ? ring_addr[ADDR_WIDTH-1:0]
-                                             : cur_desc.src_addr[ADDR_WIDTH-1:0];
-   wire [31:0]          rd_nbeats = fetching ? 32'd1 : job_nbeats;
-   wire [ADDR_WIDTH-1:0] wr_base  = cur_desc.dst_addr[ADDR_WIDTH-1:0];
+                                             : src_row_addr[ADDR_WIDTH-1:0];
+   wire [31:0]          rd_nbeats = fetching ? 32'd1 : row_beats;
+   wire [ADDR_WIDTH-1:0] wr_base  = dst_row_addr[ADDR_WIDTH-1:0];
 
    assign busy      = (state != ST_IDLE);
    assign idle      = (state == ST_IDLE) & ~rd_busy & ~wr_busy;
@@ -247,9 +255,30 @@ module vctrl_dma import vctrl_pkg::*;
            end
         end
 
-        ST_DISPATCH: state <= is_copy ? ST_COPY : ST_COMPLETE;
+        ST_DISPATCH: begin
+           if (is_copy) begin
+              src_row_addr <= cur_desc.src_addr;
+              dst_row_addr <= cur_desc.dst_addr;
+              rows_left    <= cur_desc.height;
+              state        <= ST_ROW_ISSUE;
+           end
+           else
+             state <= ST_COMPLETE;       // NOP / FENCE
+        end
 
-        ST_COPY: if (wr_done) state <= ST_COMPLETE;
+        ST_ROW_ISSUE: state <= ST_ROW_WAIT;   // rd+wr launched this cycle
+
+        ST_ROW_WAIT:
+          if (wr_done) begin
+             if (rows_left > 32'd1) begin
+                src_row_addr <= src_row_addr + cur_desc.src_pitch;
+                dst_row_addr <= dst_row_addr + cur_desc.dst_pitch;
+                rows_left    <= rows_left - 1'b1;
+                state        <= ST_ROW_ISSUE;   // next row
+             end
+             else
+               state <= ST_COMPLETE;            // last row done
+          end
 
         ST_COMPLETE: begin
            // write retiring last (B received) is the true completion
@@ -268,6 +297,9 @@ module vctrl_dma import vctrl_pkg::*;
          done_set      <= 1'b0;
          ring_head     <= '0;
          from_ring     <= 1'b0;
+         src_row_addr  <= '0;
+         dst_row_addr  <= '0;
+         rows_left     <= '0;
       end
    end
 
@@ -316,7 +348,8 @@ module vctrl_dma import vctrl_pkg::*;
       .rst           (rst_dp),
       .start         (wr_start),
       .base          (wr_base),
-      .nbeats        (job_nbeats),
+      .nbeats        (row_beats),
+      .last_be       (wr_last_be),
       .busy          (wr_busy),
       .done          (wr_done),
       .fifo_rd       (fifo_ren),

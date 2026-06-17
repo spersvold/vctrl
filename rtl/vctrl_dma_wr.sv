@@ -48,6 +48,7 @@ module vctrl_dma_wr
     input  logic                       start,   // one-cycle: begin a transfer
     input  logic [ADDR_WIDTH-1:0]      base,    // dest byte address (beat aligned)
     input  logic [31:0]                nbeats,  // number of beats to write
+    input  logic [STRB_WIDTH-1:0]      last_be, // write strobe for the final beat (partial tail)
     output logic                       busy,    // transfer in progress
     output logic                       done,    // one-cycle: all beats written + B'd
 
@@ -143,7 +144,7 @@ module vctrl_dma_wr
 
    assign len_ren      = w_start;
    assign m_axi_wdata  = fifo_dout;
-   assign m_axi_wstrb  = '1;
+   assign m_axi_wstrb  = (w_beats_left == 32'd1) ? last_be : '1;
    assign m_axi_wvalid = w_active & ~fifo_empty;
    assign m_axi_wlast  = w_active & (w_cnt == 9'd1);
    assign fifo_rd      = w_acc;

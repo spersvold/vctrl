@@ -207,3 +207,169 @@
            $display("%t ERROR: DMA ring failed (%0d mismatches, fence=%h)", $time, errors, rdata);
       end
    endtask // test_dma_ring
+
+   // ----------------------------------------------------------------------
+   // 2D testcase: copy a sub-rectangle (height>1) with mismatched source and
+   // destination row pitches. Verifies the copied cells match the source AND
+   // that the inter-row gap in the destination is untouched (proving the walk
+   // copies `width` per row, not the whole pitch).
+   // ----------------------------------------------------------------------
+   task test_dma_2d;
+
+      localparam int          WBEATS   = 4;              // rect width in beats (128 B)
+      localparam int          HROWS    = 8;              // rect height in rows
+      localparam int          SPITCH_B = 8 * 32;         // source row stride (256 B)
+      localparam int          DPITCH_B = 6 * 32;         // dest row stride (192 B, != src)
+      localparam int          WBYTES   = WBEATS * 32;
+      localparam logic [31:0] SRC_FB   = 32'h0000_1000;  // source rect base (source mem)
+      localparam logic [31:0] DST_FB   = 32'h0000_2000;  // dest rect base (dest mem)
+      localparam logic [31:0] SEQNO    = 32'h2D00_0001;
+
+      logic [31:0] rdata;
+      int          errors, r, b, gi, si, di;
+
+      begin
+         // fill the source rect rows; clear the dest rect span (rows + gaps)
+         for (r = 0; r < HROWS; r++) begin
+            for (b = 0; b < WBEATS; b++)
+              u_src.mem[(SRC_FB >> 5) + r*(SPITCH_B >> 5) + b] = {8{32'h2D00_0000 + 32'(r*16 + b)}};
+            for (b = 0; b < (DPITCH_B >> 5); b++)
+              u_dst.mem[(DST_FB >> 5) + r*(DPITCH_B >> 5) + b] = '0;
+         end
+
+         cmd_write(DMA_IRQEN_OFF,    32'h1);
+         cmd_write(DMA_CTRL_OFF,     32'h1 << DMA_CTRL_ENABLE);
+         cmd_write(DMA_SRC_OFF,      SRC_FB);
+         cmd_write(DMA_DST_OFF,      DST_FB);
+         cmd_write(DMA_SRCPITCH_OFF, SPITCH_B);
+         cmd_write(DMA_DSTPITCH_OFF, DPITCH_B);
+         cmd_write(DMA_WIDTH_OFF,    WBYTES);
+         cmd_write(DMA_HEIGHT_OFF,   HROWS);
+         cmd_write(DMA_OP_OFF,       32'(DMA_OP_COPY2D));
+
+         $display("%t INFO: DMA 2D doorbell (%0d beats x %0d rows, spitch=%0d dpitch=%0d)",
+                  $time, WBEATS, HROWS, SPITCH_B, DPITCH_B);
+         cmd_write(DMA_DOORBELL_OFF, SEQNO);
+
+         wait (dma_irq);
+         cmd_write(DMA_IRQ_OFF, 32'h1);
+         cmd_read (DMA_FENCE_OFF, rdata);
+
+         errors = 0;
+         for (r = 0; r < HROWS; r++) begin
+            for (b = 0; b < WBEATS; b++) begin          // copied cells match source
+               si = (SRC_FB >> 5) + r*(SPITCH_B >> 5) + b;
+               di = (DST_FB >> 5) + r*(DPITCH_B >> 5) + b;
+               if (u_dst.mem[di] !== u_src.mem[si]) begin
+                  errors++;
+                  if (errors <= 4)
+                    $display("  row %0d beat %0d MISMATCH dst=%h src=%h", r, b, u_dst.mem[di], u_src.mem[si]);
+               end
+            end
+            for (gi = WBEATS; gi < (DPITCH_B >> 5); gi++) begin  // gap untouched
+               di = (DST_FB >> 5) + r*(DPITCH_B >> 5) + gi;
+               if (u_dst.mem[di] !== '0) begin
+                  errors++;
+                  if (errors <= 8)
+                    $display("  row %0d gap beat %0d OVERWRITTEN dst=%h", r, gi, u_dst.mem[di]);
+               end
+            end
+         end
+
+         if (errors == 0 && rdata === SEQNO) begin
+            $display("%t INFO: DMA 2D copy verified (%0d rows x %0d beats, pitch %0d->%0d, fence=%h)",
+                     $time, HROWS, WBEATS, SPITCH_B, DPITCH_B, rdata);
+            result = 1'b1;
+         end
+         else
+           $display("%t ERROR: DMA 2D failed (%0d mismatches, fence=%h)", $time, errors, rdata);
+      end
+   endtask // test_dma_2d
+
+   // ----------------------------------------------------------------------
+   // WSTRB testcase: a width that is not a beat multiple (3 full beats + a
+   // 16-byte tail). Each row's tail beat must write only its low 16 bytes
+   // (masked by wr_last_be); the high half and the inter-row gap stay zero.
+   // ----------------------------------------------------------------------
+   task test_dma_wstrb;
+
+      localparam int          WFULL   = 3;                  // full beats per row
+      localparam int          PBYTES  = 16;                 // partial tail bytes
+      localparam int          PBITS   = PBYTES * 8;          // 128
+      localparam int          WBYTES  = WFULL*32 + PBYTES;   // 112 (not 32-aligned)
+      localparam int          HROWS   = 2;
+      localparam int          PITCH_B = 6 * 32;              // 192 (gap after each row)
+      localparam logic [31:0] SRC_FB  = 32'h0000_1000;
+      localparam logic [31:0] DST_FB  = 32'h0000_2000;
+      localparam logic [31:0] SEQNO   = 32'h57B0_0001;
+
+      logic [31:0] rdata;
+      int          errors, r, b, g, si, di;
+
+      begin
+         for (r = 0; r < HROWS; r++) begin
+            for (b = 0; b <= WFULL; b++)               // WFULL full beats + 1 partial
+              u_src.mem[(SRC_FB >> 5) + r*(PITCH_B >> 5) + b] = {8{32'h57B0_0000 + 32'(r*16 + b)}};
+            for (b = 0; b < (PITCH_B >> 5); b++)
+              u_dst.mem[(DST_FB >> 5) + r*(PITCH_B >> 5) + b] = '0;
+         end
+
+         cmd_write(DMA_IRQEN_OFF,    32'h1);
+         cmd_write(DMA_CTRL_OFF,     32'h1 << DMA_CTRL_ENABLE);
+         cmd_write(DMA_SRC_OFF,      SRC_FB);
+         cmd_write(DMA_DST_OFF,      DST_FB);
+         cmd_write(DMA_SRCPITCH_OFF, PITCH_B);
+         cmd_write(DMA_DSTPITCH_OFF, PITCH_B);
+         cmd_write(DMA_WIDTH_OFF,    WBYTES);
+         cmd_write(DMA_HEIGHT_OFF,   HROWS);
+         cmd_write(DMA_OP_OFF,       32'(DMA_OP_COPY2D));
+
+         $display("%t INFO: DMA WSTRB doorbell (width=%0d B = %0d full + %0d tail, %0d rows)",
+                  $time, WBYTES, WFULL, PBYTES, HROWS);
+         cmd_write(DMA_DOORBELL_OFF, SEQNO);
+
+         wait (dma_irq);
+         cmd_write(DMA_IRQ_OFF, 32'h1);
+         cmd_read (DMA_FENCE_OFF, rdata);
+
+         errors = 0;
+         for (r = 0; r < HROWS; r++) begin
+            for (b = 0; b < WFULL; b++) begin              // full beats copy entirely
+               si = (SRC_FB >> 5) + r*(PITCH_B >> 5) + b;
+               di = (DST_FB >> 5) + r*(PITCH_B >> 5) + b;
+               if (u_dst.mem[di] !== u_src.mem[si]) begin
+                  errors++;
+                  if (errors <= 4) $display("  row %0d full beat %0d MISMATCH", r, b);
+               end
+            end
+            // partial tail beat: low PBYTES copied, high half untouched
+            si = (SRC_FB >> 5) + r*(PITCH_B >> 5) + WFULL;
+            di = (DST_FB >> 5) + r*(PITCH_B >> 5) + WFULL;
+            if (u_dst.mem[di][PBITS-1:0] !== u_src.mem[si][PBITS-1:0]) begin
+               errors++;
+               $display("  row %0d tail-low MISMATCH dst=%h src=%h",
+                        r, u_dst.mem[di][PBITS-1:0], u_src.mem[si][PBITS-1:0]);
+            end
+            if (u_dst.mem[di][AXI_DATA_WIDTH-1:PBITS] !== '0) begin
+               errors++;
+               $display("  row %0d tail-high OVERWRITTEN dst=%h", r, u_dst.mem[di][AXI_DATA_WIDTH-1:PBITS]);
+            end
+            // inter-row gap untouched
+            for (g = WFULL+1; g < (PITCH_B >> 5); g++) begin
+               di = (DST_FB >> 5) + r*(PITCH_B >> 5) + g;
+               if (u_dst.mem[di] !== '0) begin
+                  errors++;
+                  if (errors <= 8) $display("  row %0d gap beat %0d OVERWRITTEN", r, g);
+               end
+            end
+         end
+
+         if (errors == 0 && rdata === SEQNO) begin
+            $display("%t INFO: DMA WSTRB copy verified (%0d rows, %0d-byte tail masked, fence=%h)",
+                     $time, HROWS, PBYTES, rdata);
+            result = 1'b1;
+         end
+         else
+           $display("%t ERROR: DMA WSTRB failed (%0d mismatches, fence=%h)", $time, errors, rdata);
+      end
+   endtask // test_dma_wstrb

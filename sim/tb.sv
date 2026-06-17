@@ -99,9 +99,9 @@ module tb
    // PLL reconfiguration interface (to/from board-level hdmi_pll_recfg)
    plldivcnt_t                     pll_divcnt;   // PLLDIVCNT (logical M/N/C)
    logic                           pll_apply;    // reconfig trigger pulse (clk_sys)
-   logic                           pll_done;     // reconfig done pulse (clk_sys)
-   logic                           pll_locked;   // synchronized PLL locked
-   logic                           pll_error;    // synchronized recal error
+   logic                           pll_done=1'b1;// reconfig done pulse (clk_sys)
+   logic                           pll_locked=1'b1;// synchronized PLL locked
+   logic                           pll_error=1'b1;// synchronized recal error
 
    logic [ 7:0]                    vga_r;
    logic [ 7:0]                    vga_g;
@@ -479,10 +479,12 @@ module tb
          $display("%t INFO: Running testcase '%s'", $time, testcase);
 
          case (testcase)
-           "scanout" : test_scanout;
-           "dma"     : test_dma;
-           "dma_ring": test_dma_ring;
-           default   : $error("unknown TESTCASE '%s'", testcase);
+           "scanout"  : test_scanout;
+           "dma"      : test_dma;
+           "dma_ring" : test_dma_ring;
+           "dma_2d"   : test_dma_2d;
+           "dma_wstrb": test_dma_wstrb;
+           default    : $error("unknown TESTCASE '%s'", testcase);
          endcase
 
          #100ns;

@@ -9,12 +9,13 @@ NPROC		:= $(shell nproc)
 
 VCS		:= $(VCS_HOME)/bin/vcs
 
-VCS_FLAGS	:= -q -nc -debug_acc+pp -timescale=1ns/1ps -sverilog -assert svaext +define+HAVE_VCDPLUSON +verilog2001ext+.v -top tb
+VCS_FLAGS	:= -q -nc -debug_acc+pp -timescale=1ns/1ps +lint=all -sverilog -assert svaext +define+HAVE_VCDPLUSON +verilog2001ext+.v -top tb
 # -xlrm uniq_prior_final: defer unique/priority case evaluation until
 # signals have stabilised at the end of the time step. Filters out
 # VCS's delta-cycle RT-MTOCMUCS false positives without silencing
 # real overlap detection.
 VCS_FLAGS	+= -xlrm uniq_prior_final
+VCS_FLAGS	+= +lint=all,noUI,noNS
 
 VERILATOR	:= $(VERILATOR_HOME)/bin/verilator
 VERI_OPTS	:= --timing --trace-fst --top-module tb --timescale 1ns/1ps -j $(NPROC) -O3
