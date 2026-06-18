@@ -153,8 +153,9 @@ package vctrl_pkg;
    typedef enum logic [7:0] {
       DMA_OP_NOP    = 8'd0,
       DMA_OP_COPY2D = 8'd1,   // 2D strided copy source -> destination (linear = height 1)
-      DMA_OP_FILL   = 8'd2,   // solid fill of destination (src_addr = pattern) [Phase 1.5]
-      DMA_OP_FENCE  = 8'd3    // advance fence + raise IRQ, no data movement
+      DMA_OP_FILL   = 8'd2,   // solid fill: src_addr holds a 32b ARGB color, replicated per beat
+      DMA_OP_FENCE  = 8'd3,   // advance fence + raise IRQ, no data movement
+      DMA_OP_BLEND  = 8'd4    // src OVER dst, premultiplied ARGB8888 (reads src + dst, writes dst)
    } dma_opcode_t;
 
    // Command descriptor (8 words = 32 bytes). Same layout for the PIO
@@ -162,7 +163,7 @@ package vctrl_pkg;
    // word (word0, lowest byte address in the ring):
    //   word0 opflags  [7:0] opcode, [15:8] flags
    //   word1 seqno    fence value reported on completion
-   //   word2 src_addr source byte address (read master)
+   //   word2 src_addr source byte address (read master); FILL: 32b ARGB color
    //   word3 dst_addr destination byte offset (write master)
    //   word4 src_pitch / word5 dst_pitch  row strides (bytes)
    //   word6 width    bytes per row

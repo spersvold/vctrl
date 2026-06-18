@@ -21,8 +21,12 @@
 //
 //   Same hardened discipline as the read master: awvalid is registered and
 //   held until awready, the pointer advances at launch, and AW launches are
-//   throttled by length-FIFO room + an outstanding-burst cap. wstrb is full
-//   (P1a copies are beat-aligned; partial-beat masking is a later step).
+//   throttled by length-FIFO room + an outstanding-burst cap. The final beat
+//   of a row is masked by `last_be` for non-beat-aligned widths.
+//
+//   Fill mode (no source read): when `fill_mode` is asserted the W engine
+//   drives the constant `fill_data` beat instead of the FIFO and does not pop
+//   it, so a solid fill moves no read traffic.
 // ========================================================================
 //
 
@@ -58,6 +62,12 @@ module vctrl_dma_wr
     output logic                       fifo_rd,
     input  logic [AXI_DATA_WIDTH-1:0]  fifo_dout,
     input  logic                       fifo_empty,
+
+    // ----------------------------------------------------------------------
+    // Fill mode: write a constant pattern beat, no FIFO/source read
+    // ----------------------------------------------------------------------
+    input  logic                       fill_mode,
+    input  logic [AXI_DATA_WIDTH-1:0]  fill_data,
 
     // ----------------------------------------------------------------------
     // AXI4 write master
@@ -143,11 +153,11 @@ module vctrl_dma_wr
    wire w_start = ~w_active & ~len_empty;   // begin the next queued burst
 
    assign len_ren      = w_start;
-   assign m_axi_wdata  = fifo_dout;
+   assign m_axi_wdata  = fill_mode ? fill_data : fifo_dout;
    assign m_axi_wstrb  = (w_beats_left == 32'd1) ? last_be : '1;
-   assign m_axi_wvalid = w_active & ~fifo_empty;
+   assign m_axi_wvalid = w_active & (fill_mode | ~fifo_empty);
    assign m_axi_wlast  = w_active & (w_cnt == 9'd1);
-   assign fifo_rd      = w_acc;
+   assign fifo_rd      = w_acc & ~fill_mode;
 
    assign busy = running;
 

@@ -154,14 +154,18 @@ module vctrl_dma import vctrl_pkg::*;
    // gated off during a descriptor fetch -- the fetch reuses the source read
    // master to read one beat (= one descriptor) from the ring.
    // ----------------------------------------------------------------------
-   typedef enum logic [2:0] {
-      ST_IDLE       = 3'd0,
-      ST_FETCH      = 3'd1,   // issue a one-beat descriptor read
-      ST_FETCH_WAIT = 3'd2,   // capture the fetched descriptor
-      ST_DISPATCH   = 3'd3,   // decode + set up the row walk
-      ST_ROW_ISSUE  = 3'd4,   // launch rd+wr for one row
-      ST_ROW_WAIT   = 3'd5,   // wait for the row to retire, then next row
-      ST_COMPLETE   = 3'd6    // advance fence (+ ring head)
+   typedef enum logic [3:0] {
+      ST_IDLE       = 4'd0,
+      ST_FETCH      = 4'd1,   // issue a one-beat descriptor read
+      ST_FETCH_WAIT = 4'd2,   // capture the fetched descriptor
+      ST_DISPATCH   = 4'd3,   // decode + set up the row walk
+      ST_ROW_ISSUE  = 4'd4,   // copy/fill: launch rd+wr for one row
+      ST_ROW_WAIT   = 4'd5,   // copy/fill: wait for the row to retire, then next row
+      ST_BL_SRC     = 4'd6,   // blend: read the source row into the src FIFO
+      ST_BL_SRC_W   = 4'd7,   // blend: wait for the source row read to retire
+      ST_BL_DSTWR   = 4'd8,   // blend: read dst row into dst FIFO + blend-write it back
+      ST_BL_DSTWR_W = 4'd9,   // blend: wait for the blend-write to retire, then next row
+      ST_COMPLETE   = 4'd10   // advance fence (+ ring head)
    } dma_state_t;
    dma_state_t state;
 
@@ -176,6 +180,12 @@ module vctrl_dma import vctrl_pkg::*;
 
    wire [7:0]  opcode     = cur_desc.opflags[7:0];
    wire        is_copy    = (opcode == DMA_OP_COPY2D);
+   wire        is_fill    = (opcode == DMA_OP_FILL);
+   wire        is_blend   = (opcode == DMA_OP_BLEND);
+
+   // FILL pattern: the 32-bit ARGB color in src_addr, replicated across a beat
+   localparam int PIX_PER_BEAT = AXI_DATA_WIDTH / 32;
+   wire [AXI_DATA_WIDTH-1:0] fill_data = {PIX_PER_BEAT{cur_desc.src_addr}};
    // beats per row = ceil(width / beat); the final beat may be partial and is
    // masked on the write by wr_last_be (sub-beat / non-beat-aligned widths)
    wire [31:0]           row_beats  = (cur_desc.width + 32'(STRB_WIDTH-1)) >> BEAT_LSB;
@@ -188,45 +198,158 @@ module vctrl_dma import vctrl_pkg::*;
    wire [31:0] ring_addr = ring_base + ((ring_head & ring_mask) << BEAT_LSB);
 
    // ----------------------------------------------------------------------
-   // Copy FIFO : source read master fills (except during a fetch), dest drains
-   // ----------------------------------------------------------------------
-   wire                       fifo_wen = m_axi_rvalid & m_axi_rready & ~fetching;
-   wire [FIFO_LGDEPTH:0]      fifo_fill;
-   wire                       fifo_ren;
-   wire [AXI_DATA_WIDTH-1:0]  fifo_dout;
-   wire                       fifo_empty;
-
-   sfifo #
-     (.WIDTH (AXI_DATA_WIDTH),
-      .LGSIZ (FIFO_LGDEPTH))
-   u_fifo
-     (.clk   (clk_sys),
-      .rst   (rst_dp),
-      .wen   (fifo_wen),
-      .din   (m_axi_rdata),
-      .full  (),
-      .fill  (fifo_fill),
-      .ren   (fifo_ren),
-      .dout  (fifo_dout),
-      .empty (fifo_empty));
-
-   // ----------------------------------------------------------------------
-   // Read / write master controls. rd serves both the descriptor fetch (one
-   // beat) and the copy source (job beats); the FSM never overlaps them.
+   // Read / write master controls. rd serves the descriptor fetch (one beat),
+   // the copy/blend source row, and the blend destination read-back; the FSM
+   // never overlaps these uses of the single read port.
+   //
+   //   blend_dst_pass : the read in flight is the blend destination read-back,
+   //                    routed to the dst FIFO (otherwise reads fill the src
+   //                    FIFO). Held across the read so its tail beat lands in
+   //                    the dst FIFO before the state advances.
    // ----------------------------------------------------------------------
    logic rd_busy, rd_done;
    logic wr_busy, wr_done;
 
-   wire                 rd_start  = (state == ST_FETCH) | (state == ST_ROW_ISSUE);
-   wire                 wr_start  = (state == ST_ROW_ISSUE);
-   wire [ADDR_WIDTH-1:0] rd_base  = fetching ? ring_addr[ADDR_WIDTH-1:0]
-                                             : src_row_addr[ADDR_WIDTH-1:0];
+   wire blend_dst_pass = (state == ST_BL_DSTWR) | (state == ST_BL_DSTWR_W);
+
+   wire rd_start = (state == ST_FETCH)                  |  // ring descriptor fetch
+                   ((state == ST_ROW_ISSUE) & is_copy)  |  // copy source row (FILL reads nothing)
+                   (state == ST_BL_SRC)                 |  // blend source row   -> src FIFO
+                   (state == ST_BL_DSTWR);                 // blend dest readback -> dst FIFO
+   wire wr_start = (state == ST_ROW_ISSUE) | (state == ST_BL_DSTWR);
+
+   wire [ADDR_WIDTH-1:0] rd_base  = fetching       ? ring_addr[ADDR_WIDTH-1:0]    :
+                                    blend_dst_pass ? dst_row_addr[ADDR_WIDTH-1:0] :
+                                                     src_row_addr[ADDR_WIDTH-1:0];
    wire [31:0]          rd_nbeats = fetching ? 32'd1 : row_beats;
    wire [ADDR_WIDTH-1:0] wr_base  = dst_row_addr[ADDR_WIDTH-1:0];
 
+   // ----------------------------------------------------------------------
+   // Two copy FIFOs. The src FIFO holds copy data / the blend source row; the
+   // dst FIFO holds the blend destination read-back. The read master fills
+   // whichever the current pass selects (blend_dst_pass), throttling on that
+   // FIFO's occupancy. The write master drains the src FIFO for a copy, or the
+   // per-beat SRC_OVER of (src,dst) FIFO heads for a blend.
+   // ----------------------------------------------------------------------
+   wire                       fifo_s_wen = m_axi_rvalid & m_axi_rready & ~fetching & ~blend_dst_pass;
+   wire [FIFO_LGDEPTH:0]      fifo_s_fill;
+   wire                       fifo_s_ren;
+   wire [AXI_DATA_WIDTH-1:0]  fifo_s_dout;
+   wire                       fifo_s_empty;
+
+   wire                       fifo_d_wen = m_axi_rvalid & m_axi_rready & ~fetching & blend_dst_pass;
+   wire [FIFO_LGDEPTH:0]      fifo_d_fill;
+   wire                       fifo_d_ren;
+   wire [AXI_DATA_WIDTH-1:0]  fifo_d_dout;
+   wire                       fifo_d_empty;
+
+   sfifo #
+     (.WIDTH (AXI_DATA_WIDTH),
+      .LGSIZ (FIFO_LGDEPTH))
+   u_fifo_s
+     (.clk   (clk_sys),
+      .rst   (rst_dp),
+      .wen   (fifo_s_wen),
+      .din   (m_axi_rdata),
+      .full  (),
+      .fill  (fifo_s_fill),
+      .ren   (fifo_s_ren),
+      .dout  (fifo_s_dout),
+      .empty (fifo_s_empty));
+
+   sfifo #
+     (.WIDTH (AXI_DATA_WIDTH),
+      .LGSIZ (FIFO_LGDEPTH))
+   u_fifo_d
+     (.clk   (clk_sys),
+      .rst   (rst_dp),
+      .wen   (fifo_d_wen),
+      .din   (m_axi_rdata),
+      .full  (),
+      .fill  (fifo_d_fill),
+      .ren   (fifo_d_ren),
+      .dout  (fifo_d_dout),
+      .empty (fifo_d_empty));
+
+   // throttle the read master on the FIFO it is currently filling
+   wire [FIFO_LGDEPTH:0] rd_fifo_fill = blend_dst_pass ? fifo_d_fill : fifo_s_fill;
+
+   // ----------------------------------------------------------------------
+   // Blend pipeline. The SRC_OVER ALU has a multi-cycle (pipelined-multiply)
+   // datapath, so it cannot sit combinationally between the FIFOs and writer. A
+   // feeder pops one src+dst pair per cycle into the pipeline whenever both are
+   // available and the blended-output FIFO has room for every beat that would
+   // then be in flight; the writer drains that output FIFO. The margin (>=
+   // pipeline latency) bounds overflow once the writer back-pressures. Copy and
+   // fill never enter here -- the writer drains the src FIFO (or its own
+   // pattern) directly.
+   // ----------------------------------------------------------------------
+   localparam int BLEND_LAT      = 5;                 // == vctrl_dma_blend LATENCY
+   localparam int FIFO_O_LGDEPTH = 4;
+   localparam int FIFO_O_DEPTH   = (1 << FIFO_O_LGDEPTH);
+   // stop feeding with room for every in-flight beat (>= pipeline latency)
+   localparam logic [FIFO_O_LGDEPTH:0] FIFO_O_HIWAT =
+              (FIFO_O_LGDEPTH+1)'(FIFO_O_DEPTH - 2*BLEND_LAT);
+
+   wire                       wr_fifo_rd;
+   wire                       fifo_o_ren = is_blend & wr_fifo_rd;
+   wire [FIFO_O_LGDEPTH:0]    fifo_o_fill;
+   wire [AXI_DATA_WIDTH-1:0]  fifo_o_dout;
+   wire                       fifo_o_empty;
+
+   wire blend_inject = is_blend & ~fifo_s_empty & ~fifo_d_empty &
+                       (fifo_o_fill < FIFO_O_HIWAT);
+
+   wire                       blend_out_valid;
+   wire [AXI_DATA_WIDTH-1:0]  blend_out;
+
+   vctrl_dma_blend #
+     (.AXI_DATA_WIDTH (AXI_DATA_WIDTH))
+   u_blend
+     (.clk       (clk_sys),
+      .rst       (rst_dp),
+      .in_valid  (blend_inject),
+      .s         (fifo_s_dout),
+      .d         (fifo_d_dout),
+      .out_valid (blend_out_valid),
+      .o         (blend_out));
+
+   sfifo #
+     (.WIDTH (AXI_DATA_WIDTH),
+      .LGSIZ (FIFO_O_LGDEPTH))
+   u_fifo_o
+     (.clk   (clk_sys),
+      .rst   (rst_dp),
+      .wen   (blend_out_valid),
+      .din   (blend_out),
+      .full  (),
+      .fill  (fifo_o_fill),
+      .ren   (fifo_o_ren),
+      .dout  (fifo_o_dout),
+      .empty (fifo_o_empty));
+
+   // write-data source: copy drains the src FIFO; blend drains the blended
+   // output FIFO; fill drives its own pattern in u_wr
+   wire [AXI_DATA_WIDTH-1:0] wr_din   = is_blend ? fifo_o_dout  : fifo_s_dout;
+   wire                      wr_empty = is_blend ? fifo_o_empty : fifo_s_empty;
+
+   assign fifo_s_ren = is_blend ? blend_inject : wr_fifo_rd;  // blend pops src via the feeder
+   assign fifo_d_ren = is_blend ? blend_inject : 1'b0;        // blend pops dst via the feeder
+
    assign busy      = (state != ST_IDLE);
    assign idle      = (state == ST_IDLE) & ~rd_busy & ~wr_busy;
-   assign fsm_state = {5'h0, state};
+   assign fsm_state = {4'h0, state};
+
+   // A blend buffers the whole source row in the src FIFO before the dst pass
+   // drains it, so a row must fit (minus the read master's burst reserve).
+   // synthesis translate_off
+   localparam int BL_MAX_ROW_BEATS = (1 << FIFO_LGDEPTH) - 2*BURST_LEN;
+   always_ff @(posedge clk_sys)
+     if (~rst_dp & (state == ST_DISPATCH) & is_blend)
+       assert (row_beats <= BL_MAX_ROW_BEATS)
+         else $error("BLEND row of %0d beats exceeds src-FIFO capacity %0d",
+                     row_beats, BL_MAX_ROW_BEATS);
+   // synthesis translate_on
 
    always_ff @(posedge clk_sys) begin
       done_set <= 1'b0;
@@ -256,11 +379,11 @@ module vctrl_dma import vctrl_pkg::*;
         end
 
         ST_DISPATCH: begin
-           if (is_copy) begin
+           if (is_copy | is_fill | is_blend) begin
               src_row_addr <= cur_desc.src_addr;
               dst_row_addr <= cur_desc.dst_addr;
               rows_left    <= cur_desc.height;
-              state        <= ST_ROW_ISSUE;
+              state        <= is_blend ? ST_BL_SRC : ST_ROW_ISSUE;
            end
            else
              state <= ST_COMPLETE;       // NOP / FENCE
@@ -275,6 +398,28 @@ module vctrl_dma import vctrl_pkg::*;
                 dst_row_addr <= dst_row_addr + cur_desc.dst_pitch;
                 rows_left    <= rows_left - 1'b1;
                 state        <= ST_ROW_ISSUE;   // next row
+             end
+             else
+               state <= ST_COMPLETE;            // last row done
+          end
+
+        // ---- blend: read source row -> src FIFO ----
+        ST_BL_SRC:   state <= ST_BL_SRC_W;      // rd (src) launched this cycle
+        ST_BL_SRC_W: if (rd_done) state <= ST_BL_DSTWR;
+
+        // ---- blend: read dst row -> dst FIFO, compositing-write it back ----
+        // rd (dst) and wr (blend) launch together and stream through the FIFOs.
+        // The writer only emits a beat once it has been popped from the dst
+        // FIFO -- i.e. after that beat's dst read has returned -- so the write
+        // of dst[i] always follows the read of dst[i]: no read/write hazard.
+        ST_BL_DSTWR:   state <= ST_BL_DSTWR_W;  // rd+wr launched this cycle
+        ST_BL_DSTWR_W:
+          if (wr_done) begin
+             if (rows_left > 32'd1) begin
+                src_row_addr <= src_row_addr + cur_desc.src_pitch;
+                dst_row_addr <= dst_row_addr + cur_desc.dst_pitch;
+                rows_left    <= rows_left - 1'b1;
+                state        <= ST_BL_SRC;      // next row
              end
              else
                state <= ST_COMPLETE;            // last row done
@@ -320,7 +465,7 @@ module vctrl_dma import vctrl_pkg::*;
       .nbeats        (rd_nbeats),
       .busy          (rd_busy),
       .done          (rd_done),
-      .fifo_fill     (fifo_fill),
+      .fifo_fill     (rd_fifo_fill),
       .m_axi_arid,
       .m_axi_araddr,
       .m_axi_arlen,
@@ -353,9 +498,11 @@ module vctrl_dma import vctrl_pkg::*;
       .last_be       (wr_last_be),
       .busy          (wr_busy),
       .done          (wr_done),
-      .fifo_rd       (fifo_ren),
-      .fifo_dout     (fifo_dout),
-      .fifo_empty    (fifo_empty),
+      .fifo_rd       (wr_fifo_rd),
+      .fifo_dout     (wr_din),
+      .fifo_empty    (wr_empty),
+      .fill_mode     (is_fill),
+      .fill_data     (fill_data),
       .m_axi_awid,
       .m_axi_awaddr,
       .m_axi_awlen,

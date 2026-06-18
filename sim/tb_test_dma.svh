@@ -373,3 +373,215 @@
            $display("%t ERROR: DMA WSTRB failed (%0d mismatches, fence=%h)", $time, errors, rdata);
       end
    endtask // test_dma_wstrb
+
+   // ----------------------------------------------------------------------
+   // FILL testcase: solid-fill a sub-rectangle (height>1) with a partial-width
+   // tail and an inter-row gap. Every filled cell must equal the replicated
+   // ARGB color; the masked tail-high half and the inter-row gap stay zero.
+   // No source read is issued -- this exercises the write-only path.
+   // ----------------------------------------------------------------------
+   task test_dma_fill;
+
+      localparam int          WFULL   = 3;                  // full beats per row
+      localparam int          PBYTES  = 16;                 // partial tail bytes
+      localparam int          PBITS   = PBYTES * 8;          // 128
+      localparam int          WBYTES  = WFULL*32 + PBYTES;   // 112 (not 32-aligned)
+      localparam int          HROWS   = 4;
+      localparam int          PITCH_B = 6 * 32;              // 192 (gap after each row)
+      localparam logic [31:0] DST_FB  = 32'h0000_2000;       // dest rect base (dest mem)
+      localparam logic [31:0] COLOR   = 32'hFF20_A0FF;       // ARGB fill color
+      localparam logic [31:0] SEQNO   = 32'hF111_0001;
+
+      logic [AXI_DATA_WIDTH-1:0] beat;
+      logic [31:0] rdata;
+      int          errors, r, b, g, di;
+
+      begin
+         beat = {(AXI_DATA_WIDTH/32){COLOR}};
+
+         // clear the dest rect span (rows + gaps) so any stray write shows up
+         for (r = 0; r < HROWS; r++)
+           for (b = 0; b < (PITCH_B >> 5); b++)
+             u_dst.mem[(DST_FB >> 5) + r*(PITCH_B >> 5) + b] = '0;
+
+         cmd_write(DMA_IRQEN_OFF,    32'h1);
+         cmd_write(DMA_CTRL_OFF,     32'h1 << DMA_CTRL_ENABLE);
+         cmd_write(DMA_SRC_OFF,      COLOR);             // FILL: src_addr = ARGB color
+         cmd_write(DMA_DST_OFF,      DST_FB);
+         cmd_write(DMA_SRCPITCH_OFF, 32'h0);             // unused by FILL
+         cmd_write(DMA_DSTPITCH_OFF, PITCH_B);
+         cmd_write(DMA_WIDTH_OFF,    WBYTES);
+         cmd_write(DMA_HEIGHT_OFF,   HROWS);
+         cmd_write(DMA_OP_OFF,       32'(DMA_OP_FILL));
+
+         $display("%t INFO: DMA FILL doorbell (color=%h, width=%0d B = %0d full + %0d tail, %0d rows)",
+                  $time, COLOR, WBYTES, WFULL, PBYTES, HROWS);
+         cmd_write(DMA_DOORBELL_OFF, SEQNO);
+
+         wait (dma_irq);
+         cmd_write(DMA_IRQ_OFF, 32'h1);
+         cmd_read (DMA_FENCE_OFF, rdata);
+
+         errors = 0;
+         for (r = 0; r < HROWS; r++) begin
+            for (b = 0; b < WFULL; b++) begin              // full beats == replicated color
+               di = (DST_FB >> 5) + r*(PITCH_B >> 5) + b;
+               if (u_dst.mem[di] !== beat) begin
+                  errors++;
+                  if (errors <= 4) $display("  row %0d full beat %0d MISMATCH dst=%h", r, b, u_dst.mem[di]);
+               end
+            end
+            // partial tail beat: low PBYTES filled, high half untouched
+            di = (DST_FB >> 5) + r*(PITCH_B >> 5) + WFULL;
+            if (u_dst.mem[di][PBITS-1:0] !== beat[PBITS-1:0]) begin
+               errors++;
+               $display("  row %0d tail-low MISMATCH dst=%h", r, u_dst.mem[di][PBITS-1:0]);
+            end
+            if (u_dst.mem[di][AXI_DATA_WIDTH-1:PBITS] !== '0) begin
+               errors++;
+               $display("  row %0d tail-high OVERWRITTEN dst=%h", r, u_dst.mem[di][AXI_DATA_WIDTH-1:PBITS]);
+            end
+            // inter-row gap untouched
+            for (g = WFULL+1; g < (PITCH_B >> 5); g++) begin
+               di = (DST_FB >> 5) + r*(PITCH_B >> 5) + g;
+               if (u_dst.mem[di] !== '0) begin
+                  errors++;
+                  if (errors <= 8) $display("  row %0d gap beat %0d OVERWRITTEN", r, g);
+               end
+            end
+         end
+
+         if (errors == 0 && rdata === SEQNO) begin
+            $display("%t INFO: DMA FILL verified (%0d rows, color=%h, %0d-byte tail masked, fence=%h)",
+                     $time, HROWS, COLOR, PBYTES, rdata);
+            result = 1'b1;
+         end
+         else
+           $display("%t ERROR: DMA FILL failed (%0d mismatches, fence=%h)", $time, errors, rdata);
+      end
+   endtask // test_dma_fill
+
+   // ----------------------------------------------------------------------
+   // Software reference for the premultiplied SRC_OVER compositor -- must
+   // match vctrl_dma_blend exactly (same div255 rounding).
+   // ----------------------------------------------------------------------
+   function automatic logic [7:0] ref_div255(input logic [15:0] x);
+      logic [16:0] t;
+      t         = 17'(x) + 17'd128;
+      ref_div255 = 8'((t + (t >> 8)) >> 8);
+   endfunction
+   function automatic logic [7:0] ref_chan(input logic [7:0] sc, input logic [7:0] dc, input logic [7:0] ia);
+      logic [8:0] sum;
+      sum      = 9'(sc) + 9'(ref_div255(16'(dc) * 16'(ia)));
+      ref_chan = sum[8] ? 8'hFF : sum[7:0];
+   endfunction
+   function automatic logic [31:0] ref_over(input logic [31:0] s, input logic [31:0] d);
+      logic [7:0] ia;
+      ia = 8'd255 - s[31:24];
+      ref_over = { ref_chan(s[31:24], d[31:24], ia),     // A
+                   ref_chan(s[23:16], d[23:16], ia),     // R
+                   ref_chan(s[15: 8], d[15: 8], ia),     // G
+                   ref_chan(s[ 7: 0], d[ 7: 0], ia) };   // B
+   endfunction
+
+   // ----------------------------------------------------------------------
+   // BLEND testcase: premultiplied SRC_OVER of a source row onto a destination
+   // row, over a 2-row rect with a partial-width (non-beat-aligned) tail. The
+   // engine reads the source row, reads the destination row, composites per
+   // pixel, and writes the result back. In the bench both reads are served by
+   // u_src (source over-layer and destination under-layer in separate regions)
+   // and the result lands in u_dst; the same-address read-before-write ordering
+   // is guaranteed structurally (each write beat is gated on its dst-FIFO pop)
+   // and is exercised on hardware where src/dst share VRAM.
+   // ----------------------------------------------------------------------
+   task test_dma_blend;
+
+      localparam int          WPIX    = 20;                 // pixels/row (80B = 2 beats + 16B tail)
+      localparam int          WBYTES  = WPIX * 4;            // 80
+      localparam int          HROWS   = 2;
+      localparam int          PITCH_B = 4 * 32;              // 128 (gap after each row)
+      localparam logic [31:0] SRC_FB  = 32'h0000_0000;       // source over-layer  (u_src)
+      localparam logic [31:0] DST_FB  = 32'h0000_8000;       // dest under-layer: read u_src, write u_dst
+      localparam logic [31:0] SEQNO   = 32'hB1E0_0001;
+
+      logic [AXI_DATA_WIDTH-1:0] sbeat, dbeat;
+      logic [31:0] sp, dp, got, exp, rdata;
+      logic [7:0]  sa;
+      int          errors, r, p, nbeat, b, lane;
+
+      begin
+         nbeat = (WBYTES + 31) / 32;        // beats per row (ceil); last is partial
+
+         // build the source over-layer and destination under-layer in u_src,
+         // clear the u_dst rect (rows + gaps) so a missed/extra write shows up
+         for (r = 0; r < HROWS; r++) begin
+            for (b = 0; b < nbeat; b++) begin
+               for (p = 0; p < 8; p++) begin
+                  sa = 8'(p*37 + r*113 + b*5);                 // vary src alpha
+                  sp = {sa, sa, sa >> 1, sa >> 2};             // premultiplied: rgb <= a
+                  dp = {8'hFF, 8'(p*29 + r*61), 8'(p*7 + 13), 8'(p*53)}; // opaque under-layer
+                  sbeat[p*32 +: 32] = sp;
+                  dbeat[p*32 +: 32] = dp;
+               end
+               u_src.mem[(SRC_FB >> 5) + r*(PITCH_B >> 5) + b] = sbeat;
+               u_src.mem[(DST_FB >> 5) + r*(PITCH_B >> 5) + b] = dbeat;
+            end
+            for (b = 0; b < (PITCH_B >> 5); b++)
+              u_dst.mem[(DST_FB >> 5) + r*(PITCH_B >> 5) + b] = '0;
+         end
+
+         cmd_write(DMA_IRQEN_OFF,    32'h1);
+         cmd_write(DMA_CTRL_OFF,     32'h1 << DMA_CTRL_ENABLE);
+         cmd_write(DMA_SRC_OFF,      SRC_FB);
+         cmd_write(DMA_DST_OFF,      DST_FB);
+         cmd_write(DMA_SRCPITCH_OFF, PITCH_B);
+         cmd_write(DMA_DSTPITCH_OFF, PITCH_B);
+         cmd_write(DMA_WIDTH_OFF,    WBYTES);
+         cmd_write(DMA_HEIGHT_OFF,   HROWS);
+         cmd_write(DMA_OP_OFF,       32'(DMA_OP_BLEND));
+
+         $display("%t INFO: DMA BLEND doorbell (%0d px x %0d rows, %0dB tail)",
+                  $time, WPIX, HROWS, WBYTES - (nbeat-1)*32);
+         cmd_write(DMA_DOORBELL_OFF, SEQNO);
+
+         wait (dma_irq);
+         cmd_write(DMA_IRQ_OFF, 32'h1);
+         cmd_read (DMA_FENCE_OFF, rdata);
+
+         errors = 0;
+         for (r = 0; r < HROWS; r++) begin
+            // the WPIX composited pixels must equal the reference
+            for (p = 0; p < WPIX; p++) begin
+               b    = p / 8;
+               lane = p % 8;
+               sp  = u_src.mem[(SRC_FB >> 5) + r*(PITCH_B >> 5) + b][lane*32 +: 32];
+               dp  = u_src.mem[(DST_FB >> 5) + r*(PITCH_B >> 5) + b][lane*32 +: 32];
+               exp = ref_over(sp, dp);
+               got = u_dst.mem[(DST_FB >> 5) + r*(PITCH_B >> 5) + b][lane*32 +: 32];
+               if (got !== exp) begin
+                  errors++;
+                  if (errors <= 6)
+                    $display("  row %0d px %0d MISMATCH got=%h exp=%h (s=%h d=%h)", r, p, got, exp, sp, dp);
+               end
+            end
+            // pixels past WPIX in the masked tail beat must be untouched (0)
+            for (p = WPIX; p < nbeat*8; p++) begin
+               b    = p / 8;
+               lane = p % 8;
+               got  = u_dst.mem[(DST_FB >> 5) + r*(PITCH_B >> 5) + b][lane*32 +: 32];
+               if (got !== '0) begin
+                  errors++;
+                  if (errors <= 6) $display("  row %0d px %0d tail OVERWRITTEN got=%h", r, p, got);
+               end
+            end
+         end
+
+         if (errors == 0 && rdata === SEQNO) begin
+            $display("%t INFO: DMA BLEND verified (%0d px x %0d rows, premult SRC_OVER, fence=%h)",
+                     $time, WPIX, HROWS, rdata);
+            result = 1'b1;
+         end
+         else
+           $display("%t ERROR: DMA BLEND failed (%0d mismatches, fence=%h)", $time, errors, rdata);
+      end
+   endtask // test_dma_blend

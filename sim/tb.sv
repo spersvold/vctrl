@@ -422,6 +422,8 @@ module tb
            "dma_ring" : test_dma_ring;
            "dma_2d"   : test_dma_2d;
            "dma_wstrb": test_dma_wstrb;
+           "dma_fill" : test_dma_fill;
+           "dma_blend": test_dma_blend;
            default    : $error("unknown TESTCASE '%s'", testcase);
          endcase
 
