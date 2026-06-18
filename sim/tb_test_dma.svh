@@ -462,6 +462,83 @@
    endtask // test_dma_fill
 
    // ----------------------------------------------------------------------
+   // 4 KiB-boundary testcase: a wide partial-width strided copy whose rows are
+   // long enough -- and whose base is beat-aligned but NOT 512 B-aligned -- that
+   // a max-length burst would cross a 4 KiB boundary. This is the X11 window-blit
+   // geometry (and the one the contiguous, 4 KiB-aligned copy-on-flip path never
+   // exercises). AXI4 forbids an INCR burst from crossing 4 KiB; the masters must
+   // split there. The always-on checker in tb.sv latches axi4k_violation if any
+   // issued burst crosses; this test fails on that flag. The data check is kept
+   // too (a mis-split that dropped/duplicated beats would corrupt it) but cannot
+   // by itself catch the crossing -- the axi_ram models linearize, returning
+   // correct data even for an illegal burst, which is precisely why the bug
+   // reached hardware.
+   // ----------------------------------------------------------------------
+   task test_dma_4k;
+
+      localparam int          WBEATS  = 175;             // 5600 B/row (> 4 KiB)
+      localparam int          HROWS   = 4;
+      localparam int          PITCH_B = 7680;            // 1080p scanout pitch
+      localparam int          WBYTES  = WBEATS * 32;
+      localparam logic [31:0] SRC_FB  = 32'h0000_04C0;   // 1216 B: beat-aligned, not 512 B-aligned
+      localparam logic [31:0] DST_FB  = 32'h0008_04C0;   // same low bits, clear of the source span
+      localparam logic [31:0] SEQNO   = 32'h04C0_0001;
+
+      logic [31:0] rdata;
+      int          errors, r, b, si, di;
+
+      begin
+         axi4k_violation = 1'b0;
+
+         // position-encoded source rows; clear the matching dest rows
+         for (r = 0; r < HROWS; r++)
+           for (b = 0; b < WBEATS; b++) begin
+              u_src.mem[(SRC_FB >> 5) + r*(PITCH_B >> 5) + b] = {8{32'h4B00_0000 + 32'(r*256 + b)}};
+              u_dst.mem[(DST_FB >> 5) + r*(PITCH_B >> 5) + b] = '0;
+           end
+
+         cmd_write(DMA_IRQEN_OFF,    32'h1);
+         cmd_write(DMA_CTRL_OFF,     32'h1 << DMA_CTRL_ENABLE);
+         cmd_write(DMA_SRC_OFF,      SRC_FB);
+         cmd_write(DMA_DST_OFF,      DST_FB);
+         cmd_write(DMA_SRCPITCH_OFF, PITCH_B);
+         cmd_write(DMA_DSTPITCH_OFF, PITCH_B);
+         cmd_write(DMA_WIDTH_OFF,    WBYTES);
+         cmd_write(DMA_HEIGHT_OFF,   HROWS);
+         cmd_write(DMA_OP_OFF,       32'(DMA_OP_COPY2D));
+
+         $display("%t INFO: DMA 4KiB-cross doorbell (%0d beats x %0d rows, base=%h pitch=%0d)",
+                  $time, WBEATS, HROWS, SRC_FB, PITCH_B);
+         cmd_write(DMA_DOORBELL_OFF, SEQNO);
+
+         wait (dma_irq);
+         cmd_write(DMA_IRQ_OFF, 32'h1);
+         cmd_read (DMA_FENCE_OFF, rdata);
+
+         errors = 0;
+         for (r = 0; r < HROWS; r++)
+           for (b = 0; b < WBEATS; b++) begin
+              si = (SRC_FB >> 5) + r*(PITCH_B >> 5) + b;
+              di = (DST_FB >> 5) + r*(PITCH_B >> 5) + b;
+              if (u_dst.mem[di] !== u_src.mem[si]) begin
+                 errors++;
+                 if (errors <= 4)
+                   $display("  row %0d beat %0d MISMATCH dst=%h src=%h", r, b, u_dst.mem[di], u_src.mem[si]);
+              end
+           end
+
+         if (errors == 0 && rdata === SEQNO && !axi4k_violation) begin
+            $display("%t INFO: DMA 4KiB-cross copy verified (%0d rows x %0d beats), no crossing burst",
+                     $time, HROWS, WBEATS);
+            result = 1'b1;
+         end
+         else
+           $display("%t ERROR: DMA 4KiB-cross failed (errors=%0d fence=%h 4k_violation=%b)",
+                    $time, errors, rdata, axi4k_violation);
+      end
+   endtask // test_dma_4k
+
+   // ----------------------------------------------------------------------
    // Software reference for the premultiplied SRC_OVER compositor -- must
    // match vctrl_dma_blend exactly (same div255 rounding).
    // ----------------------------------------------------------------------

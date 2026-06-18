@@ -87,8 +87,15 @@ module vctrl_dma_rd
    wire r_acc      = m_axi_rvalid  & m_axi_rready;
    wire ar_pending = m_axi_arvalid & ~m_axi_arready;
 
-   // Beats in the burst we are about to launch (short final burst).
-   wire [8:0] this_burst = (beats_left >= BURST_LEN) ? 9'(BURST_LEN) : beats_left[8:0];
+   // Beats in the burst we are about to launch (short final burst), additionally
+   // clamped so the burst never crosses a 4 KiB boundary -- AXI4 forbids an INCR
+   // burst from spanning one, and a crossing burst is handled as undefined by the
+   // downstream interconnect (observed: the page bit is dropped, displacing data
+   // by 4 KiB). cur_addr is beat-aligned, so beats_to_page is exact (1..PAGE_BEATS).
+   localparam integer PAGE_BEATS = 4096 >> BEAT_LSB;   // beats per 4 KiB page
+   wire [8:0] burst_cap    = (beats_left >= BURST_LEN) ? 9'(BURST_LEN) : beats_left[8:0];
+   wire [8:0] beats_to_page = 9'(PAGE_BEATS) - 9'(cur_addr[11:BEAT_LSB]);
+   wire [8:0] this_burst   = (beats_to_page < burst_cap) ? beats_to_page : burst_cap;
 
    // Beats just accepted = the held arlen+1.
    wire [CNTW-1:0] acc_beats = CNTW'(m_axi_arlen) + 1'b1;

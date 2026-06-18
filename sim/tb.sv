@@ -365,6 +365,43 @@ module tb
 
    //
 
+   // ----------------------------------------------------------------------
+   // AXI4 protocol checker: an INCR burst must never cross a 4 KiB boundary.
+   // The axi_ram models index memory linearly, so they return correct data
+   // even for an illegal crossing burst -- a data-only check cannot see the
+   // violation (exactly how this escaped to hardware, where the interconnect
+   // mis-handles it and displaces data by 4 KiB). This watches both DMA
+   // address channels at acceptance and latches a sticky flag the testcases
+   // assert on.
+   // ----------------------------------------------------------------------
+   logic axi4k_violation;
+   initial axi4k_violation = 1'b0;
+
+   function automatic bit crosses_4k(input logic [AXI_ADDR_WIDTH-1:0] addr,
+                                     input logic [7:0]                len,
+                                     input logic [2:0]                size);
+      logic [31:0]               nbytes;
+      logic [AXI_ADDR_WIDTH-1:0] last;
+      nbytes = (32'(len) + 32'd1) << size;
+      last   = addr + nbytes[AXI_ADDR_WIDTH-1:0] - 1'b1;
+      return (addr[AXI_ADDR_WIDTH-1:12] != last[AXI_ADDR_WIDTH-1:12]);
+   endfunction
+
+   always @(posedge clk_sys) if (!rst_sys) begin
+      if (rd_arvalid & rd_arready & (rd_arburst == 2'b01) &
+          crosses_4k(rd_araddr, rd_arlen, rd_arsize)) begin
+         axi4k_violation <= 1'b1;
+         $display("%t AXI4 VIOLATION: read burst crosses 4 KiB (araddr=%h arlen=%0d arsize=%0d)",
+                  $time, rd_araddr, rd_arlen, rd_arsize);
+      end
+      if (m_axi_awvalid & m_axi_awready & (m_axi_awburst == 2'b01) &
+          crosses_4k(m_axi_awaddr, m_axi_awlen, m_axi_awsize)) begin
+         axi4k_violation <= 1'b1;
+         $display("%t AXI4 VIOLATION: write burst crosses 4 KiB (awaddr=%h awlen=%0d awsize=%0d)",
+                  $time, m_axi_awaddr, m_axi_awlen, m_axi_awsize);
+      end
+   end
+
    longint unsigned expectedRunTime;
    initial expectedRunTime = 1_000;
 
@@ -424,6 +461,7 @@ module tb
            "dma_wstrb": test_dma_wstrb;
            "dma_fill" : test_dma_fill;
            "dma_blend": test_dma_blend;
+           "dma_4k"   : test_dma_4k;
            default    : $error("unknown TESTCASE '%s'", testcase);
          endcase
 

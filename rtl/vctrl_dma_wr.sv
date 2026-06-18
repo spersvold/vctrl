@@ -106,7 +106,15 @@ module vctrl_dma_wr
 
    wire aw_acc     = m_axi_awvalid & m_axi_awready;
    wire aw_pending = m_axi_awvalid & ~m_axi_awready;
-   wire [8:0] this_aw = (aw_beats_left >= BURST_LEN) ? 9'(BURST_LEN) : aw_beats_left[8:0];
+
+   // Burst beats, clamped both to BURST_LEN and to the next 4 KiB boundary: AXI4
+   // forbids an INCR burst from crossing one, and a crossing burst is handled as
+   // undefined by the downstream interconnect (mis-addressed writes). aw_addr is
+   // beat-aligned, so beats_to_page is exact (1..PAGE_BEATS).
+   localparam integer PAGE_BEATS = 4096 >> BEAT_LSB;   // beats per 4 KiB page
+   wire [8:0] aw_cap       = (aw_beats_left >= BURST_LEN) ? 9'(BURST_LEN) : aw_beats_left[8:0];
+   wire [8:0] beats_to_page = 9'(PAGE_BEATS) - 9'(aw_addr[11:BEAT_LSB]);
+   wire [8:0] this_aw      = (beats_to_page < aw_cap) ? beats_to_page : aw_cap;
 
    // Length FIFO: each accepted AW's beat count, consumed by the W engine.
    wire        len_full, len_empty;
