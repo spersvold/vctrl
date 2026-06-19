@@ -461,6 +461,7 @@ module tb
            "dma_wstrb": test_dma_wstrb;
            "dma_fill" : test_dma_fill;
            "dma_blend": test_dma_blend;
+           "dma_blend_unaligned": test_dma_blend_unaligned;
            "dma_4k"   : test_dma_4k;
            default    : $error("unknown TESTCASE '%s'", testcase);
          endcase

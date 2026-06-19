@@ -6,6 +6,7 @@
 ../rtl/vctrl_dma_rd.sv
 ../rtl/vctrl_dma_wr.sv
 ../rtl/vctrl_dma_blend.sv
+../rtl/vctrl_dma_realign.sv
 ../rtl/vctrl_dma.sv
 axi_ram.sv
 tb.sv

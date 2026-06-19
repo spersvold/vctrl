@@ -662,3 +662,125 @@
            $display("%t ERROR: DMA BLEND failed (%0d mismatches, fence=%h)", $time, errors, rdata);
       end
    endtask // test_dma_blend
+
+   // ----------------------------------------------------------------------
+   // Unaligned BLEND: composite a source whose sub-beat byte offset differs
+   // from the destination's. The source read stream is realigned
+   // (vctrl_dma_realign) to the dst offset so source pixel k composites over
+   // dst pixel k, and the write masks the partial first/last beats. One run:
+   // verifies the @wpix composited pixels == the SW premult-over reference at
+   // their byte-exact destination, and that dst bytes outside [dst,dst+width)
+   // (head + tail, prefilled with a recognizable sentinel) are untouched.
+   // Offsets are pixel-aligned (multiples of 4), as a cursor's always are.
+   // ----------------------------------------------------------------------
+   task automatic blend_unaligned_run(input int sbase, input int dbase,
+                                      input int soff,  input int doff,
+                                      input int wpix,  input int hrows,
+                                      output bit ok);
+      localparam int          PITCH = 512;              // 32-aligned; wide enough that
+                                                        // adjacent rows never share a beat
+      localparam logic [31:0] SENT  = 32'hDEAD_BEEF;    // dst head/tail prefill
+      localparam logic [31:0] SEQNO = 32'hB1E0_0002;
+
+      int          src_fb, dst_fb, wbytes, sbyte, dbyte, drow0;
+      logic [7:0]  sa;
+      logic [31:0] sp, dp, got, exp, rdata;
+      int          errors, r, p, beat, lane;
+
+      begin
+         axi4k_violation = 1'b0;
+         src_fb = sbase + soff;
+         dst_fb = dbase + doff;
+         wbytes = wpix * 4;
+         errors = 0;
+
+         for (r = 0; r < hrows; r++) begin
+            // seed every dst beat the row touches with the sentinel (in u_dst);
+            // init the same src/dst-underlayer beats in u_src to avoid X
+            for (beat = (dst_fb + r*PITCH) >> 5;
+                 beat <= (dst_fb + r*PITCH + wbytes - 1) >> 5; beat++)
+              u_dst.mem[beat] = {8{SENT}};
+            for (beat = (src_fb + r*PITCH) >> 5;
+                 beat <= (src_fb + r*PITCH + wbytes - 1) >> 5; beat++)
+              u_src.mem[beat] = '0;
+            for (beat = (dst_fb + r*PITCH) >> 5;
+                 beat <= (dst_fb + r*PITCH + wbytes - 1) >> 5; beat++)
+              u_src.mem[beat] = '0;
+            for (p = 0; p < wpix; p++) begin
+               sa = 8'(p*37 + r*113);
+               sp = {sa, sa, sa >> 1, sa >> 2};                       // premult src
+               dp = {8'hFF, 8'(p*29 + r*61), 8'(p*7 + 13), 8'(p*53)}; // opaque dst
+               sbyte = src_fb + r*PITCH + p*4;
+               dbyte = dst_fb + r*PITCH + p*4;
+               u_src.mem[sbyte >> 5][((sbyte >> 2) & 7)*32 +: 32] = sp;
+               u_src.mem[dbyte >> 5][((dbyte >> 2) & 7)*32 +: 32] = dp;
+            end
+         end
+
+         cmd_write(DMA_IRQEN_OFF,    32'h1);
+         cmd_write(DMA_CTRL_OFF,     32'h1 << DMA_CTRL_ENABLE);
+         cmd_write(DMA_SRC_OFF,      src_fb);
+         cmd_write(DMA_DST_OFF,      dst_fb);
+         cmd_write(DMA_SRCPITCH_OFF, PITCH);
+         cmd_write(DMA_DSTPITCH_OFF, PITCH);
+         cmd_write(DMA_WIDTH_OFF,    wbytes);
+         cmd_write(DMA_HEIGHT_OFF,   hrows);
+         cmd_write(DMA_OP_OFF,       32'(DMA_OP_BLEND));
+
+         $display("%t INFO: BLEND unaligned src@%h dst@%h (soff=%0d doff=%0d %0d px x %0d rows)",
+                  $time, src_fb, dst_fb, soff, doff, wpix, hrows);
+         cmd_write(DMA_DOORBELL_OFF, SEQNO);
+
+         wait (dma_irq);
+         cmd_write(DMA_IRQ_OFF, 32'h1);
+         cmd_read (DMA_FENCE_OFF, rdata);
+
+         for (r = 0; r < hrows; r++) begin
+            for (p = 0; p < wpix; p++) begin              // composited pixels
+               sbyte = src_fb + r*PITCH + p*4;
+               dbyte = dst_fb + r*PITCH + p*4;
+               sp  = u_src.mem[sbyte >> 5][((sbyte >> 2) & 7)*32 +: 32];
+               dp  = u_src.mem[dbyte >> 5][((dbyte >> 2) & 7)*32 +: 32];
+               exp = ref_over(sp, dp);
+               got = u_dst.mem[dbyte >> 5][((dbyte >> 2) & 7)*32 +: 32];
+               if (got !== exp) begin
+                  errors++;
+                  if (errors <= 6)
+                    $display("    row %0d px %0d MISMATCH got=%h exp=%h", r, p, got, exp);
+               end
+            end
+            for (beat = (dst_fb + r*PITCH) >> 5;          // head/tail untouched
+                 beat <= (dst_fb + r*PITCH + wbytes - 1) >> 5; beat++)
+              for (lane = 0; lane < 8; lane++) begin
+                 dbyte = beat*32 + lane*4;
+                 if (dbyte < (dst_fb + r*PITCH) || dbyte >= (dst_fb + r*PITCH + wbytes)) begin
+                    got = u_dst.mem[beat][lane*32 +: 32];
+                    if (got !== SENT) begin
+                       errors++;
+                       if (errors <= 6)
+                         $display("    row %0d beat %0d lane %0d OVERWRITTEN got=%h", r, beat, lane, got);
+                    end
+                 end
+              end
+         end
+
+         ok = (errors == 0) && (rdata === SEQNO) && !axi4k_violation;
+         $display("%t %s: BLEND unaligned soff=%0d doff=%0d (%0d errors, fence=%h, viol=%b)",
+                  $time, ok ? "INFO" : "ERROR", soff, doff, errors, rdata, axi4k_violation);
+      end
+   endtask // blend_unaligned_run
+
+   task automatic test_dma_blend_unaligned;
+      bit ok, all_ok;
+      begin
+         all_ok = 1'b1;
+         blend_unaligned_run('h0000, 'h8000,  4, 20, 20, 2, ok); all_ok &= ok; // shift=16, +head beat
+         blend_unaligned_run('h0000, 'h8000,  0, 16, 17, 2, ok); all_ok &= ok; // src aligned, dst offset
+         blend_unaligned_run('h0000, 'h8000, 28,  4, 10, 2, ok); all_ok &= ok; // soff>doff (look-ahead)
+         blend_unaligned_run('h0000, 'h8000,  0, 28,  5, 1, ok); all_ok &= ok; // tiny head, single short row
+         blend_unaligned_run('h0000, 'h8000,  8,  8, 20, 2, ok); all_ok &= ok; // shift=0 (regression)
+         blend_unaligned_run('h0F40, 'h8F40,  0, 16, 64, 2, ok); all_ok &= ok; // source crosses 4 KiB
+         result = all_ok;
+         $display("%t %s: DMA BLEND unaligned suite", $time, all_ok ? "INFO" : "ERROR");
+      end
+   endtask // test_dma_blend_unaligned

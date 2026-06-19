@@ -186,12 +186,31 @@ module vctrl_dma import vctrl_pkg::*;
    // FILL pattern: the 32-bit ARGB color in src_addr, replicated across a beat
    localparam int PIX_PER_BEAT = AXI_DATA_WIDTH / 32;
    wire [AXI_DATA_WIDTH-1:0] fill_data = {PIX_PER_BEAT{cur_desc.src_addr}};
-   // beats per row = ceil(width / beat); the final beat may be partial and is
-   // masked on the write by wr_last_be (sub-beat / non-beat-aligned widths)
-   wire [31:0]           row_beats  = (cur_desc.width + 32'(STRB_WIDTH-1)) >> BEAT_LSB;
-   wire [STRB_WIDTH-1:0] wr_last_be = (cur_desc.width[BEAT_LSB-1:0] == '0)
+
+   // Sub-beat byte offsets of the current row's source/destination. A BLEND can
+   // compose a source whose offset differs from the destination's: the source
+   // read is realigned (u_realign) to the destination's offset, and the write
+   // masks the partial first/last beats. COPY2D/FILL stay on the natural grid
+   // (offsets forced 0) -- byte-identical to before this revision.
+   wire                  realign_en  = is_blend;
+   wire [BEAT_LSB-1:0]   src_off     = realign_en ? src_row_addr[BEAT_LSB-1:0] : '0;
+   wire [BEAT_LSB-1:0]   dst_off     = realign_en ? dst_row_addr[BEAT_LSB-1:0] : '0;
+
+   // Per-pass beats: ceil((off + width)/beat). The source span (read) and the
+   // destination span (read-back + write) can differ by one beat; the realigner
+   // consumes src_row_beats and emits dst_row_beats.
+   wire [31:0] src_row_beats = (32'(src_off) + cur_desc.width + 32'(STRB_WIDTH-1)) >> BEAT_LSB;
+   wire [31:0] dst_row_beats = (32'(dst_off) + cur_desc.width + 32'(STRB_WIDTH-1)) >> BEAT_LSB;
+
+   // Write byte-strobes: head masks the low dst_off bytes of the first beat,
+   // tail masks the partial last beat ((dst_off + width) mod beat). With
+   // dst_off = 0 the head is all-ones and the tail reduces to the old width-tail.
+   wire [STRB_WIDTH-1:0] wr_head_be = {STRB_WIDTH{1'b1}} << dst_off;
+   wire [BEAT_LSB:0]     tail_sum   = {1'b0, dst_off} + {1'b0, cur_desc.width[BEAT_LSB-1:0]};
+   wire [BEAT_LSB-1:0]   tail_bytes = tail_sum[BEAT_LSB-1:0];
+   wire [STRB_WIDTH-1:0] wr_tail_be = (tail_bytes == '0)
                                     ? {STRB_WIDTH{1'b1}}
-                                    : (STRB_WIDTH'(1) << cur_desc.width[BEAT_LSB-1:0]) - STRB_WIDTH'(1);
+                                    : (STRB_WIDTH'(1) << tail_bytes) - STRB_WIDTH'(1);
 
    // ring fetch address: ring_base + (head mod entries) * 32 bytes
    wire [31:0] ring_mask = (32'd1 << ring_size) - 32'd1;
@@ -221,7 +240,9 @@ module vctrl_dma import vctrl_pkg::*;
    wire [ADDR_WIDTH-1:0] rd_base  = fetching       ? ring_addr[ADDR_WIDTH-1:0]    :
                                     blend_dst_pass ? dst_row_addr[ADDR_WIDTH-1:0] :
                                                      src_row_addr[ADDR_WIDTH-1:0];
-   wire [31:0]          rd_nbeats = fetching ? 32'd1 : row_beats;
+   wire [31:0]          rd_nbeats = fetching       ? 32'd1 :
+                                    blend_dst_pass ? dst_row_beats :
+                                                     src_row_beats;
    wire [ADDR_WIDTH-1:0] wr_base  = dst_row_addr[ADDR_WIDTH-1:0];
 
    // ----------------------------------------------------------------------
@@ -231,7 +252,15 @@ module vctrl_dma import vctrl_pkg::*;
    // FIFO's occupancy. The write master drains the src FIFO for a copy, or the
    // per-beat SRC_OVER of (src,dst) FIFO heads for a blend.
    // ----------------------------------------------------------------------
-   wire                       fifo_s_wen = m_axi_rvalid & m_axi_rready & ~fetching & ~blend_dst_pass;
+   // Raw source beat accepted into the source path (copy/blend source row).
+   wire                       src_beat = m_axi_rvalid & m_axi_rready & ~fetching & ~blend_dst_pass;
+   // BLEND routes the source through the realigner (re-aligns to the dst offset);
+   // COPY2D/FILL keep the direct, beat-aligned path untouched.
+   wire                       realign_out_valid;
+   wire [AXI_DATA_WIDTH-1:0]  realign_out_data;
+   wire                       realign_busy;
+   wire                       fifo_s_wen = is_blend ? realign_out_valid : src_beat;
+   wire [AXI_DATA_WIDTH-1:0]  fifo_s_din = is_blend ? realign_out_data  : m_axi_rdata;
    wire [FIFO_LGDEPTH:0]      fifo_s_fill;
    wire                       fifo_s_ren;
    wire [AXI_DATA_WIDTH-1:0]  fifo_s_dout;
@@ -250,12 +279,34 @@ module vctrl_dma import vctrl_pkg::*;
      (.clk   (clk_sys),
       .rst   (rst_dp),
       .wen   (fifo_s_wen),
-      .din   (m_axi_rdata),
+      .din   (fifo_s_din),
       .full  (),
       .fill  (fifo_s_fill),
       .ren   (fifo_s_ren),
       .dout  (fifo_s_dout),
       .empty (fifo_s_empty));
+
+   // ----------------------------------------------------------------------
+   // Source realigner (BLEND only). Re-cuts the beat-aligned source read
+   // stream into one aligned to the destination's sub-beat offset, so a sprite
+   // can be composited at an arbitrary destination X. Started at the blend
+   // source-row launch; copy/fill bypass it (is_blend == 0).
+   // ----------------------------------------------------------------------
+   vctrl_dma_realign #
+     (.AXI_DATA_WIDTH (AXI_DATA_WIDTH))
+   u_realign
+     (.clk       (clk_sys),
+      .rst       (rst_dp),
+      .start     (state == ST_BL_SRC),
+      .src_off   (src_off),
+      .dst_off   (dst_off),
+      .out_beats (dst_row_beats),
+      .in_beats  (src_row_beats),
+      .in_valid  (src_beat & is_blend),
+      .in_data   (m_axi_rdata),
+      .out_valid (realign_out_valid),
+      .out_data  (realign_out_data),
+      .busy      (realign_busy));
 
    sfifo #
      (.WIDTH (AXI_DATA_WIDTH),
@@ -346,9 +397,10 @@ module vctrl_dma import vctrl_pkg::*;
    localparam int BL_MAX_ROW_BEATS = (1 << FIFO_LGDEPTH) - 2*BURST_LEN;
    always_ff @(posedge clk_sys)
      if (~rst_dp & (state == ST_DISPATCH) & is_blend)
-       assert (row_beats <= BL_MAX_ROW_BEATS)
-         else $error("BLEND row of %0d beats exceeds src-FIFO capacity %0d",
-                     row_beats, BL_MAX_ROW_BEATS);
+       // +1 covers the extra beat a non-zero sub-beat offset can add
+       assert (((cur_desc.width + 32'(STRB_WIDTH-1)) >> BEAT_LSB) + 32'd1 <= BL_MAX_ROW_BEATS)
+         else $error("BLEND row of %0d bytes exceeds src-FIFO capacity %0d beats",
+                     cur_desc.width, BL_MAX_ROW_BEATS);
    // synthesis translate_on
 
    always_ff @(posedge clk_sys) begin
@@ -405,7 +457,11 @@ module vctrl_dma import vctrl_pkg::*;
 
         // ---- blend: read source row -> src FIFO ----
         ST_BL_SRC:   state <= ST_BL_SRC_W;      // rd (src) launched this cycle
-        ST_BL_SRC_W: if (rd_done) state <= ST_BL_DSTWR;
+        // wait for the source read to retire (rd idle) AND the realigner to
+        // flush its last beat into the src FIFO before draining it in the dst
+        // pass -- both are level signals (rd_done is only a 1-cycle pulse and
+        // the realigner's tail flush can trail it).
+        ST_BL_SRC_W: if (~rd_busy & ~realign_busy) state <= ST_BL_DSTWR;
 
         // ---- blend: read dst row -> dst FIFO, compositing-write it back ----
         // rd (dst) and wr (blend) launch together and stream through the FIFOs.
@@ -494,8 +550,9 @@ module vctrl_dma import vctrl_pkg::*;
       .rst           (rst_dp),
       .start         (wr_start),
       .base          (wr_base),
-      .nbeats        (row_beats),
-      .last_be       (wr_last_be),
+      .nbeats        (dst_row_beats),
+      .head_be       (wr_head_be),
+      .last_be       (wr_tail_be),
       .busy          (wr_busy),
       .done          (wr_done),
       .fifo_rd       (wr_fifo_rd),

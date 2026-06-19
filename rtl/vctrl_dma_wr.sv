@@ -52,6 +52,7 @@ module vctrl_dma_wr
     input  logic                       start,   // one-cycle: begin a transfer
     input  logic [ADDR_WIDTH-1:0]      base,    // dest byte address (beat aligned)
     input  logic [31:0]                nbeats,  // number of beats to write
+    input  logic [STRB_WIDTH-1:0]      head_be, // write strobe for the first beat (partial head)
     input  logic [STRB_WIDTH-1:0]      last_be, // write strobe for the final beat (partial tail)
     output logic                       busy,    // transfer in progress
     output logic                       done,    // one-cycle: all beats written + B'd
@@ -156,13 +157,20 @@ module vctrl_dma_wr
    logic       w_active;
    logic [8:0] w_cnt;          // beats left in the current W burst
    logic [31:0] w_beats_left;  // beats left overall
+   logic [31:0] w_nbeats;      // row beat count (latched), to spot the first beat
 
    wire w_acc   = m_axi_wvalid & m_axi_wready;
    wire w_start = ~w_active & ~len_empty;   // begin the next queued burst
 
+   // mask the partial first beat (head) and last beat (tail); a single-beat row
+   // ANDs both. head_be is all-ones for beat-aligned (copy/fill) writes.
+   wire w_first_beat = (w_beats_left == w_nbeats);
+   wire w_last_beat  = (w_beats_left == 32'd1);
+
    assign len_ren      = w_start;
    assign m_axi_wdata  = fill_mode ? fill_data : fifo_dout;
-   assign m_axi_wstrb  = (w_beats_left == 32'd1) ? last_be : '1;
+   assign m_axi_wstrb  = (w_first_beat ? head_be : {STRB_WIDTH{1'b1}})
+                       & (w_last_beat  ? last_be : {STRB_WIDTH{1'b1}});
    assign m_axi_wvalid = w_active & (fill_mode | ~fifo_empty);
    assign m_axi_wlast  = w_active & (w_cnt == 9'd1);
    assign fifo_rd      = w_acc & ~fill_mode;
@@ -212,6 +220,7 @@ module vctrl_dma_wr
          aw_addr       <= {base[ADDR_WIDTH-1:BEAT_LSB], {BEAT_LSB{1'b0}}};
          aw_beats_left <= nbeats;
          w_beats_left  <= nbeats;
+         w_nbeats      <= nbeats;
          bursts_out    <= '0;
       end
       else if (all_done) begin
